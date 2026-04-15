@@ -28,6 +28,7 @@ class FitResult:
     dxf_cx: float      # DXF centroid X used for rotation pivot (pixels)
     dxf_cy: float      # DXF centroid Y used for rotation pivot (pixels)
     inlier_frac: float # fraction of DXF points within 3px of edges
+    dist_t: np.ndarray | None = None  # distance transform for heatmap overlay
 
 
 def fit(
@@ -147,5 +148,6 @@ def fit(
         dxf_cx=dxf_cx,
         dxf_cy=dxf_cy,
         inlier_frac=inlier_frac,
+        dist_t=dist_t,
     )
 

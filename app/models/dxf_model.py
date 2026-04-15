@@ -1,19 +1,10 @@
-"""
-Metrology Vision Pro — DXF Model
-Parses a DXF file using ezdxf and produces pixel-space polylines.
-
-Track A (math):  Pixel-space polylines used for the fitting engine and display.
-Track B (display): Same polylines rendered as QPainterPath with cosmetic pens.
-
-The DXF is converted from mm → pixel coordinates at load time, centred on the
-canvas.  This matches the proven POC approach exactly.
-"""
-
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass, field
 
 import ezdxf
+from ezdxf import path
 import numpy as np
 
 
@@ -21,20 +12,20 @@ import numpy as np
 class DxfData:
     """Result of parsing a DXF file."""
     polylines: list[np.ndarray] = field(default_factory=list)  # Nx2 float32, pixel coords
-    dxf_center_mm: tuple[float, float] = (0.0, 0.0)           # centre of DXF bounding box (mm)
+    dxf_center_mm: tuple[float, float] = (0.0, 0.0)  # centre of DXF bounding box (mm)
 
 
 def load_dxf(
-    path: str,
-    px_per_mm: float,
-    canvas_shape: tuple[int, int] = (3648, 5472),
+        filepath: str,
+        px_per_mm: float,
+        canvas_shape: tuple[int, int] = (3648, 5472),
 ) -> DxfData:
     """
-    Parse *path* and return pixel-space polylines centred on the canvas.
+    Parse *filepath* and return pixel-space polylines centred on the canvas.
 
     Parameters
     ----------
-    path : str
+    filepath : str
         Path to the .dxf file.
     px_per_mm : float
         Camera calibration (pixels per millimetre).
@@ -45,114 +36,107 @@ def load_dxf(
     -------
     DxfData
     """
-    doc = ezdxf.readfile(path)
+    doc = ezdxf.readfile(filepath)
     msp = doc.modelspace()
 
-    # ── Step 1: collect raw DXF segments (x0, y0, x1, y1) in mm ─────
-    segments: list[tuple[float, float, float, float]] = []
+    # ── Step 1: Extract all geometry universally ──────────────────────
+    segments = []
 
-    for e in msp:
-        t = e.dxftype()
+    # Helper to unpack blocks (INSERTs) into base geometry
+    def iter_all_entities(layout):
+        for e in layout:
+            if e.dxftype() == 'INSERT':
+                try:
+                    # Explode the block reference into virtual entities
+                    yield from e.virtual_entities()
+                except Exception:
+                    pass  # Safely ignore broken block references
+            else:
+                yield e
 
-        if t == "LINE":
-            segments.append((
-                e.dxf.start.x, e.dxf.start.y,
-                e.dxf.end.x, e.dxf.end.y,
-            ))
+    for e in iter_all_entities(msp):
+        try:
+            # make_path handles Lines, Arcs, Circles, Ellipses, Splines, Polylines natively
+            p = path.make_path(e)
 
-        elif t == "LWPOLYLINE":
-            pts = list(e.get_points())
+            # Flatten with a 0.05mm tolerance
+            pts = list(p.flattening(distance=0.05))
+            if len(pts) < 2:
+                continue
+
             for i in range(len(pts) - 1):
-                segments.append((pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]))
-            if e.closed and len(pts) > 1:
-                segments.append((pts[-1][0], pts[-1][1], pts[0][0], pts[0][1]))
-
-        elif t == "CIRCLE":
-            c, r = e.dxf.center, e.dxf.radius
-            pts_c = [
-                (c.x + r * np.cos(a * 2 * np.pi / 60),
-                 c.y + r * np.sin(a * 2 * np.pi / 60))
-                for a in range(61)
-            ]
-            for i in range(60):
-                segments.append((*pts_c[i], *pts_c[i + 1]))
-
-        elif t == "ARC":
-            c, r = e.dxf.center, e.dxf.radius
-            a0 = np.radians(e.dxf.start_angle)
-            a1 = np.radians(e.dxf.end_angle)
-            if a1 < a0:
-                a1 += 2 * np.pi
-            n = max(12, int(abs(a1 - a0) / np.pi * 60))
-            angles = np.linspace(a0, a1, n)
-            pts_a = [(c.x + r * np.cos(a), c.y + r * np.sin(a)) for a in angles]
-            for i in range(len(pts_a) - 1):
-                segments.append((*pts_a[i], *pts_a[i + 1]))
-
-        elif t == "SPLINE":
-            try:
-                pts_s = list(e.flattening(distance=0.05))
-            except Exception:
-                continue
-            if len(pts_s) < 2:
-                continue
-            for i in range(len(pts_s) - 1):
-                segments.append((pts_s[i].x, pts_s[i].y, pts_s[i + 1].x, pts_s[i + 1].y))
+                segments.append((pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y))
+        except TypeError:
+            # Entity doesn't support path generation (e.g., Text, Hatch, Dimensions)
+            continue
 
     if not segments:
         raise ValueError("No supported geometry found in the DXF file.")
 
-    # ── Step 2: compute DXF bounding-box centre (mm) ────────────────
-    all_xy = np.array(
-        [(x, y) for x0, y0, x1, y1 in segments for x, y in [(x0, y0), (x1, y1)]]
-    )
-    min_xy = all_xy.min(axis=0)
-    max_xy = all_xy.max(axis=0)
-    dxf_cx = (min_xy[0] + max_xy[0]) / 2
-    dxf_cy = (min_xy[1] + max_xy[1]) / 2
+    # ── Step 2: Compute DXF bounding-box efficiently ──────────────────
+    # Vectorize the bounds calculation for speed
+    seg_array = np.array(segments, dtype=np.float32)  # Shape: (N, 4)
+    x_coords = np.concatenate([seg_array[:, 0], seg_array[:, 2]])
+    y_coords = np.concatenate([seg_array[:, 1], seg_array[:, 3]])
 
-    # ── Step 3: convert mm → pixel, centred on canvas ────────────────
+    dxf_cx = (x_coords.min() + x_coords.max()) / 2.0
+    dxf_cy = (y_coords.min() + y_coords.max()) / 2.0
+
+    # ── Step 3: Vectorized coordinate transformation ──────────────────
     H, W = canvas_shape
     canvas_cx, canvas_cy = W / 2.0, H / 2.0
-    scale = px_per_mm
 
-    def to_px(x: float, y: float) -> tuple[float, float]:
-        return (
-            canvas_cx + (x - dxf_cx) * scale,
-            canvas_cy - (y - dxf_cy) * scale,     # Y-flip: DXF Y-up → pixel Y-down
-        )
+    # Transform all X coordinates
+    x_px = canvas_cx + (x_coords - dxf_cx) * px_per_mm
+    # Transform all Y coordinates (Y-flip: DXF Y-up → pixel Y-down)
+    y_px = canvas_cy - (y_coords - dxf_cy) * px_per_mm
 
-    # ── Step 4: chain segments into polylines (POC logic) ────────────
-    px_segments = [
-        (to_px(x0, y0), to_px(x1, y1))
-        for x0, y0, x1, y1 in segments
-    ]
+    # Rebuild segments in pixel space: [(x0, y0, x1, y1), ...]
+    px_segments = np.column_stack([
+        x_px[:len(segments)], y_px[:len(segments)],
+        x_px[len(segments):], y_px[len(segments):]
+    ])
+
+    # ── Step 4: O(N) Topology Chaining ────────────────────────────────
+    # Use a dictionary to map rounded point coordinates to segment indices
+    # This completely eliminates the previous O(N^2) search bottleneck.
+    adjacency = collections.defaultdict(list)
+
+    def pt_key(x, y):
+        return (round(x, 1), round(y, 1))  # 0.1 pixel tolerance for connection
+
+    for i, (x0, y0, x1, y1) in enumerate(px_segments):
+        adjacency[pt_key(x0, y0)].append((i, x1, y1))
+        adjacency[pt_key(x1, y1)].append((i, x0, y0))
 
     polylines: list[np.ndarray] = []
-    remaining = list(px_segments)
+    used_segments = set()
 
-    while remaining:
-        seg = remaining.pop(0)
-        chain = [seg[0], seg[1]]
-        changed = True
-        while changed:
-            changed = False
-            for i, s in enumerate(remaining):
-                p0, p1 = s
-                if np.linalg.norm(np.array(chain[-1]) - np.array(p0)) < 2:
-                    chain.append(p1)
-                    remaining.pop(i)
-                    changed = True
-                    break
-                elif np.linalg.norm(np.array(chain[-1]) - np.array(p1)) < 2:
-                    chain.append(p0)
-                    remaining.pop(i)
-                    changed = True
-                    break
+    for i, (x0, y0, x1, y1) in enumerate(px_segments):
+        if i in used_segments:
+            continue
+
+        chain = [(x0, y0), (x1, y1)]
+        used_segments.add(i)
+
+        # Grow the chain forward
+        while True:
+            last_pt = chain[-1]
+            key = pt_key(*last_pt)
+
+            # Find an unused segment connected to this point
+            connected = next((seg for seg in adjacency[key] if seg[0] not in used_segments), None)
+
+            if connected:
+                seg_idx, next_x, next_y = connected
+                used_segments.add(seg_idx)
+                chain.append((next_x, next_y))
+            else:
+                break
+
         polylines.append(np.array(chain, dtype=np.float32))
 
     return DxfData(
         polylines=polylines,
-        dxf_center_mm=(dxf_cx, dxf_cy),
+        dxf_center_mm=(float(dxf_cx), float(dxf_cy)),
     )
-

@@ -155,7 +155,7 @@ class ComparePresenter(QObject):
               f"angle={result.angle_deg:.2f}°  cost={result.cost:.2f}  "
               f"inlier={result.inlier_frac * 100:.1f}%")
 
-        self._overlay.draw_aligned(
+        self._overlay.draw_heatmap(
             self._dxf_data.polylines,
             result,
         )
