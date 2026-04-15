@@ -12,6 +12,7 @@ import sys
 from app.models.camera import CameraManager
 from app.models.settings import AppSettings
 from app.presenters.camera_presenter import CameraPresenter
+from app.presenters.compare_presenter import ComparePresenter
 from app.presenters.settings_presenter import SettingsPresenter
 from app.views.main_window import MetrologyWindow
 
@@ -59,9 +60,21 @@ class AppOrchestrator:
             app_dir=self._app_dir,
         )
 
+        self._compare_presenter = ComparePresenter(
+            settings=self._settings,
+            viewer=self._window.viewer,
+            toolbar=self._window.toolbar,
+            settings_panel=self._window.settings_panel,
+        )
+
         # Toolbar repositioning after mode switch
         self._window.toolbar.btn_measure.clicked.connect(self._reposition_toolbar)
         self._window.toolbar.btn_compare.clicked.connect(self._reposition_toolbar)
+
+        # Clear DXF overlay when switching back to Measure mode
+        self._window.toolbar.btn_measure.clicked.connect(
+            self._compare_presenter.clear_overlay
+        )
 
         # Clean shutdown
         self._window.destroyed.connect(self._cleanup)

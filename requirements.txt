@@ -2,4 +2,6 @@ PySide6
 imagingcontrol4
 numpy
 opencv-python
+ezdxf
+scipy
 
