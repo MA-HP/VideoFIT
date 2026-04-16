@@ -59,9 +59,10 @@ def fit(
 
     dxf_edge_pts = np.column_stack(np.where(dxf_edge_img > 0))[:, [1, 0]].astype(np.float32)
 
+    # Use a larger, deterministic sample for stability
     rng = np.random.default_rng(0)
     rng.shuffle(dxf_edge_pts)
-    n_sample = min(800, len(dxf_edge_pts))
+    n_sample = min(2000, len(dxf_edge_pts))
     dxf_sample = dxf_edge_pts[:n_sample]
 
     # ── Step 2: Compute centroids ─────────────────────────────────────
@@ -95,23 +96,35 @@ def fit(
             return 1e6
         return float(dist_t[ny[valid], nx[valid]].mean())
 
-    # ── Step 4: Coarse angle sweep (36 candidates) ────────────────────
-    best_cost = 1e9
-    best_params = [tx_init, ty_init, 0.0]
-    for angle_try in np.linspace(-np.pi, np.pi, 36, endpoint=False):
+    # ── Step 4: Coarse angle sweep (72 candidates) — keep top 3 ──────
+    sweep_results = []
+    for angle_try in np.linspace(-np.pi, np.pi, 72, endpoint=False):
         c = chamfer_cost([tx_init, ty_init, angle_try])
-        if c < best_cost:
-            best_cost = c
-            best_params = [tx_init, ty_init, angle_try]
+        sweep_results.append((c, [tx_init, ty_init, angle_try]))
+    sweep_results.sort(key=lambda x: x[0])
+    top_candidates = sweep_results[:3]
 
-    # ── Step 5: Nelder-Mead refinement ───────────────────────────────
-    res = minimize(
-        chamfer_cost,
-        np.array(best_params, dtype=np.float64),
-        method="Nelder-Mead",
-        options={"xatol": 0.05, "fatol": 0.05, "maxiter": 10000},
-    )
-    tx_opt, ty_opt, angle_opt = res.x
+    # ── Step 5: Refine each top candidate with Nelder-Mead then Powell
+    best_res = None
+    for _, candidate_params in top_candidates:
+        # Pass 1: Nelder-Mead (robust basin finder)
+        r1 = minimize(
+            chamfer_cost,
+            np.array(candidate_params, dtype=np.float64),
+            method="Nelder-Mead",
+            options={"xatol": 0.5, "fatol": 0.5, "maxiter": 5000},
+        )
+        # Pass 2: Powell (deterministic, sub-pixel precision)
+        r2 = minimize(
+            chamfer_cost,
+            r1.x,
+            method="Powell",
+            options={"xtol": 0.01, "ftol": 0.001, "maxiter": 10000},
+        )
+        if best_res is None or r2.fun < best_res.fun:
+            best_res = r2
+
+    tx_opt, ty_opt, angle_opt = best_res.x
 
     # ── Step 6: Inlier fraction ───────────────────────────────────────
     cos_t = np.cos(angle_opt)
@@ -126,7 +139,7 @@ def fit(
         tx=float(tx_opt),
         ty=float(ty_opt),
         angle_deg=float(np.degrees(angle_opt)),
-        cost=float(res.fun),
+        cost=float(best_res.fun),
         dxf_cx=dxf_cx,
         dxf_cy=dxf_cy,
         inlier_frac=inlier_frac,
