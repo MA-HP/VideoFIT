@@ -94,8 +94,8 @@ class AppOrchestrator:
         self._window.show()
 
     def cleanup(self) -> None:
-        """Explicitly stop streaming — call before ic4.Library.exit()."""
-        self._camera_service.disconnect()
+        """Explicitly release all IC4 resources — call before ic4.Library.exit()."""
+        self._camera_service.release()
 
     # ------------------------------------------------------------------
     # Internal

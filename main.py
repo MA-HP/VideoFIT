@@ -27,6 +27,7 @@ def main() -> None:
 
         # Explicit cleanup before library teardown
         orchestrator.cleanup()
+        del orchestrator  # ensure IC4 objects are GC'd before Library.exit()
     finally:
         ic4.Library.exit()
 

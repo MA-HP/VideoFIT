@@ -113,6 +113,17 @@ class CameraService(QObject):
             self._grabber.stream_stop()
             self._grabber.device_close()
 
+    def release(self) -> None:
+        """
+        Explicitly release all IC4 resources (Grabber, Sink, DeviceInfo list).
+        Must be called before ic4.Library.exit() to avoid destructor errors.
+        """
+        self.disconnect()
+        self._connected_devices.clear()
+        # Drop references so IC4 objects are destroyed NOW while library is still alive
+        self._sink = None  # type: ignore[assignment]
+        self._grabber = None  # type: ignore[assignment]
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
