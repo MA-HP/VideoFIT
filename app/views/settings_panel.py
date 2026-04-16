@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Settings Panel
+VideoFIT — Settings Panel
 Glass-morphism floating panel with calibration, comparison and camera controls.
 """
 

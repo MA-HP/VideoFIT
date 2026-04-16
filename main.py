@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Entry Point
+VideoFIT — Entry Point
 Initialises the IC4 library, creates the QApplication, and launches the orchestrator.
 """
 

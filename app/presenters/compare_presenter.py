@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Compare Presenter
+VideoFIT — Compare Presenter
 Orchestrates the DXF-to-piece alignment pipeline:
   Load DXF → Edge detection → Distance transform → Fit → Overlay
 
@@ -13,9 +13,11 @@ import numpy as np
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtWidgets import QFileDialog
 
-from app.models.dxf_fitter import FitResult, fit
-from app.models.dxf_model import DxfData, load_dxf
-from app.models.edge_processor import compute_edges
+from app.models.fit_result import FitResult
+from app.models.dxf import Dxf
+from app.services.dxf_service import load_dxf
+from app.services.edge_service import compute_edges
+from app.services.fit_service import fit
 from app.models.settings import AppSettings
 from app.views.dxf_overlay import DxfOverlay
 from app.views.image_viewer import ImageViewer
@@ -32,7 +34,7 @@ class _FitSignals(QObject):
 class _FitWorker(QRunnable):
     """Runs the heavy edge-detection + Nelder-Mead pipeline off the UI thread."""
 
-    def __init__(self, frame_bgr: np.ndarray, dxf_data: DxfData) -> None:
+    def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf) -> None:
         super().__init__()
         self.frame_bgr = frame_bgr
         self.dxf_data = dxf_data
@@ -75,7 +77,7 @@ class ComparePresenter(QObject):
         self._toolbar = toolbar
         self._settings_panel = settings_panel
 
-        self._dxf_data: DxfData | None = None
+        self._dxf_data: Dxf | None = None
         self._overlay = DxfOverlay(self._viewer._scene)
         self._pool = QThreadPool.globalInstance()
 

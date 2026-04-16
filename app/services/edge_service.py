@@ -1,41 +1,42 @@
 """
-Metrology Vision Pro — Edge Processor
-Two-step edge detection and distance-transform computation.
-
-Faithfully reproduces the proven POC pipeline:
-  1. Silhouette mask (largest contour)
-  2. Gamma correction → CLAHE → bilateral filter → Canny
-  3. Contour outline drawn onto edge map
-  4. Masked to silhouette
-  5. Distance transform
+VideoFIT — Edge Service
+Business logic for edge detection and distance-transform computation.
+The EdgeResult dataclass (pure structure) lives in app.models.edge_processor.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import cv2
 import numpy as np
 
-
-@dataclass
-class EdgeResult:
-    """Intermediate products of the edge-detection pipeline."""
-    mask: np.ndarray              # uint8  binary silhouette mask
-    edges: np.ndarray             # uint8  Canny edge map (within mask)
-    distance_field: np.ndarray    # float32 distance transform
-    silhouette_centroid: np.ndarray  # (x, y) in pixel coords
+from app.models.edge_result import EdgeResult
 
 
 def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
     """
     Run the full two-step edge pipeline on a **BGR** frame.
 
-    This matches the POC's ``preprocess_image`` + distance transform exactly.
+    Steps
+    -----
+    1. Silhouette mask  (largest contour via adaptive threshold)
+    2. Gamma correction → CLAHE → bilateral filter → Canny
+    3. Silhouette contour drawn onto edge map for boundary completeness
+    4. Edges masked to the silhouette region
+    5. Distance transform on the inverted edge map
+
+    Parameters
+    ----------
+    frame_bgr : np.ndarray
+        Input image in BGR colour order (as delivered by OpenCV / IC4).
+
+    Returns
+    -------
+    EdgeResult
+        Mask, edge map, distance field, and silhouette centroid.
     """
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-    # ── Step 1: Silhouette mask ──────────────────────────────────────
+    # ── Step 1: Silhouette mask ───────────────────────────────────────
     blur = cv2.GaussianBlur(gray, (15, 15), 0)
     thresh = cv2.adaptiveThreshold(
         blur, 255,
@@ -63,32 +64,25 @@ def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
         cx, cy = w / 2.0, h / 2.0
 
     # ── Step 2: Enhanced edge detection ──────────────────────────────
-    # Gamma correction
     gamma = 0.8
     inv_gamma = 1.0 / gamma
-    table = np.array([
-        ((i / 255.0) ** inv_gamma) * 255 for i in range(256)
-    ]).astype("uint8")
+    table = np.array(
+        [((i / 255.0) ** inv_gamma) * 255 for i in range(256)]
+    ).astype("uint8")
     gamma_corrected = cv2.LUT(gray, table)
 
-    # CLAHE
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     eq = clahe.apply(gamma_corrected)
 
-    # Bilateral filter (edge-preserving smoothing)
     filtered = cv2.bilateralFilter(eq, d=5, sigmaColor=50, sigmaSpace=50)
-
-    # Canny
     edges = cv2.Canny(filtered, 95, 145)
 
-    # Draw the silhouette contour onto edges for better boundary matching
     if largest_contour is not None:
         cv2.drawContours(edges, [largest_contour], -1, 255, thickness=1)
 
-    # Mask edges to the silhouette region only
     final_edges = cv2.bitwise_and(edges, edges, mask=mask)
 
-    # ── Step 3: Distance transform ───────────────────────────────────
+    # ── Step 3: Distance transform ────────────────────────────────────
     dist = cv2.distanceTransform(~final_edges, cv2.DIST_L2, 5)
 
     return EdgeResult(

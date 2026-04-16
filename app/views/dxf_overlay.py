@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — DXF Overlay
+VideoFIT — DXF Overlay
 Draws fitted DXF polylines onto a QGraphicsScene using cosmetic pens.
 
 Two rendering modes:
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsScene,
 )
 
-from app.models.dxf_fitter import FitResult
+from app.models.fit_result import FitResult
 
 
 _PREVIEW_COLOR = QColor(0, 200, 255, 255)   # cyan

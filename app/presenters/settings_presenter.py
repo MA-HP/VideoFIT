@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Settings Presenter
+VideoFIT — Settings Presenter
 Manages the settings panel toggle and applies default values from AppSettings.
 """
 

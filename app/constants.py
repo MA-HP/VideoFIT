@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — UI Constants & Shared Styles
+VideoFIT — UI Constants & Shared Styles
 """
 
 MARGIN = 20

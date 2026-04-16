@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Main Window (View)
+VideoFIT — Main Window (View)
 Frameless glassmorphism shell. Contains only layout and positioning —
 no business logic.
 """

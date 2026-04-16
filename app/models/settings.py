@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Application Settings Model
+VideoFIT — Application Settings Model
 Dataclasses and JSON loading for appsettings.json.
 """
 

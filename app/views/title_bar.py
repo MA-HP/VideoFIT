@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Title Bar
+VideoFIT — Title Bar
 Frameless window title bar with drag-to-move, minimize, maximize and close.
 """
 

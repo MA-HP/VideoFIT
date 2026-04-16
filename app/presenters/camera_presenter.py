@@ -1,6 +1,6 @@
 """
-Metrology Vision Pro — Camera Presenter
-Reacts to camera-combo changes, drives CameraManager, and updates the view.
+VideoFIT — Camera Presenter
+Reacts to camera-combo changes, drives CameraService, and updates the view.
 """
 
 from __future__ import annotations
@@ -9,19 +9,19 @@ import os
 
 from PySide6.QtCore import QObject
 
-from app.models.camera import CameraManager
 from app.models.settings import AppSettings
+from app.services.camera_service import CameraService
 from app.views.image_viewer import ImageViewer
 from app.views.settings_panel import SettingsPanel
 
 
 class CameraPresenter(QObject):
-    """Mediates between the camera combo box, the CameraManager, and the viewer."""
+    """Mediates between the camera combo box, the CameraService, and the viewer."""
 
     def __init__(
         self,
         settings: AppSettings,
-        camera_manager: CameraManager,
+        camera_service: CameraService,
         panel: SettingsPanel,
         viewer: ImageViewer,
         app_dir: str,
@@ -29,7 +29,7 @@ class CameraPresenter(QObject):
     ) -> None:
         super().__init__(parent)
         self._settings = settings
-        self._camera = camera_manager
+        self._camera = camera_service
         self._panel = panel
         self._viewer = viewer
         self._app_dir = app_dir

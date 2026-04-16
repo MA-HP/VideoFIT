@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Orchestrator
+VideoFIT — Orchestrator
 Application-level wiring: creates models, views, and presenters,
 connects signals, and manages the lifecycle.
 """
@@ -9,8 +9,8 @@ from __future__ import annotations
 import os
 import sys
 
-from app.models.camera import CameraManager
 from app.models.settings import AppSettings
+from app.services.camera_service import CameraService
 from app.presenters.camera_presenter import CameraPresenter
 from app.presenters.compare_presenter import ComparePresenter
 from app.presenters.settings_presenter import SettingsPresenter
@@ -36,14 +36,14 @@ class AppOrchestrator:
         # --- Models ---
         settings_path = os.path.join(self._app_dir, "appsettings.json")
         self._settings = AppSettings.from_json(settings_path)
-        self._camera_manager = CameraManager()
-        self._camera_manager.refresh_device_list()
+        self._camera_service = CameraService()
+        self._camera_service.refresh_device_list()
 
         # --- View ---
         self._window = MetrologyWindow()
 
         # Connect camera frames → viewer
-        self._camera_manager.frame_ready.connect(self._window.viewer.update_image)
+        self._camera_service.frame_ready.connect(self._window.viewer.update_image)
 
         # --- Presenters ---
         self._settings_presenter = SettingsPresenter(
@@ -54,7 +54,7 @@ class AppOrchestrator:
 
         self._camera_presenter = CameraPresenter(
             settings=self._settings,
-            camera_manager=self._camera_manager,
+            camera_service=self._camera_service,
             panel=self._window.settings_panel,
             viewer=self._window.viewer,
             app_dir=self._app_dir,
@@ -95,7 +95,7 @@ class AppOrchestrator:
 
     def cleanup(self) -> None:
         """Explicitly stop streaming — call before ic4.Library.exit()."""
-        self._camera_manager.disconnect()
+        self._camera_service.disconnect()
 
     # ------------------------------------------------------------------
     # Internal
@@ -106,5 +106,5 @@ class AppOrchestrator:
         self._window._position_floating_elements()
 
     def _cleanup(self) -> None:
-        self._camera_manager.disconnect()
+        self._camera_service.disconnect()
 

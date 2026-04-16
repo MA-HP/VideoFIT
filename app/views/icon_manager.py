@@ -1,4 +1,8 @@
-# python
+"""
+VideoFIT — DXF Overlay
+Render SVG icons from the "icons" directory, with automatic text-based fallbacks.
+Rasterise SVG into a QPixmap of the requested size.
+"""
 import os
 
 from PySide6.QtCore import Qt, QRect

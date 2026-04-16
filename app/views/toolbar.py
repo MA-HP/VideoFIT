@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Toolbar
+VideoFIT — Toolbar
 Mode-switching toolbar (Measure / Compare) with contextual tool pages.
 """
 

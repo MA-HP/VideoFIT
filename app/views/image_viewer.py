@@ -1,5 +1,5 @@
 """
-Metrology Vision Pro — Image Viewer
+VideoFIT — Image Viewer
 QGraphicsView with pan & zoom for live camera frames.
 """
 
