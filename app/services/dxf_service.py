@@ -6,8 +6,6 @@ The DxfData dataclass (pure structure) lives in app.models.dxf_model.
 
 from __future__ import annotations
 
-import collections
-
 import ezdxf
 from ezdxf import path
 import numpy as np
@@ -34,14 +32,18 @@ def load_dxf(
 
     Returns
     -------
-    DxfData
+    Dxf
         Dataclass holding pixel-space polylines and the DXF bounding-box centre.
     """
     doc = ezdxf.readfile(filepath)
     msp = doc.modelspace()
 
-    # ── Step 1: Extract all geometry universally ──────────────────────
-    segments = []
+    # ── Step 1: Extract geometry per entity ───────────────────────────
+    # Each DXF entity (LINE, ARC, SPLINE, CIRCLE, LWPOLYLINE…) becomes its own
+    # polyline. We do NOT chain/merge adjacent segments — preserving entity
+    # boundaries is crucial for "points of interest" in Complete mode and gives
+    # the optimizer many more independently-shaped features to lock onto.
+    raw_polylines_mm: list[np.ndarray] = []
 
     def iter_all_entities(layout):
         for e in layout:
@@ -59,68 +61,29 @@ def load_dxf(
             pts = list(p.flattening(distance=0.05))
             if len(pts) < 2:
                 continue
-            for i in range(len(pts) - 1):
-                segments.append((pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y))
-        except TypeError:
+            raw_polylines_mm.append(
+                np.array([[q.x, q.y] for q in pts], dtype=np.float32)
+            )
+        except (TypeError, Exception):
             continue
 
-    if not segments:
+    if not raw_polylines_mm:
         raise ValueError("No supported geometry found in the DXF file.")
 
     # ── Step 2: Bounding-box centre (mm space) ────────────────────────
-    seg_array = np.array(segments, dtype=np.float32)
-    x_coords = np.concatenate([seg_array[:, 0], seg_array[:, 2]])
-    y_coords = np.concatenate([seg_array[:, 1], seg_array[:, 3]])
+    all_pts_mm = np.vstack(raw_polylines_mm)
+    dxf_cx = (all_pts_mm[:, 0].min() + all_pts_mm[:, 0].max()) / 2.0
+    dxf_cy = (all_pts_mm[:, 1].min() + all_pts_mm[:, 1].max()) / 2.0
 
-    dxf_cx = (x_coords.min() + x_coords.max()) / 2.0
-    dxf_cy = (y_coords.min() + y_coords.max()) / 2.0
-
-    # ── Step 3: Coordinate transform → pixel space ───────────────────
+    # ── Step 3: Coordinate transform → pixel space (per polyline) ────
     H, W = canvas_shape
     canvas_cx, canvas_cy = W / 2.0, H / 2.0
 
-    x_px = canvas_cx + (x_coords - dxf_cx) * px_per_mm
-    y_px = canvas_cy - (y_coords - dxf_cy) * px_per_mm  # Y-flip: DXF Y-up → pixel Y-down
-
-    px_segments = np.column_stack([
-        x_px[: len(segments)], y_px[: len(segments)],
-        x_px[len(segments) :], y_px[len(segments) :],
-    ])
-
-    # ── Step 4: O(N) topology chaining ───────────────────────────────
-    adjacency: dict = collections.defaultdict(list)
-
-    def pt_key(x, y):
-        return (round(x, 1), round(y, 1))
-
-    for i, (x0, y0, x1, y1) in enumerate(px_segments):
-        adjacency[pt_key(x0, y0)].append((i, x1, y1))
-        adjacency[pt_key(x1, y1)].append((i, x0, y0))
-
     polylines: list[np.ndarray] = []
-    used_segments: set[int] = set()
-
-    for i, (x0, y0, x1, y1) in enumerate(px_segments):
-        if i in used_segments:
-            continue
-
-        chain = [(x0, y0), (x1, y1)]
-        used_segments.add(i)
-
-        while True:
-            last_pt = chain[-1]
-            key = pt_key(*last_pt)
-            connected = next(
-                (seg for seg in adjacency[key] if seg[0] not in used_segments), None
-            )
-            if connected:
-                seg_idx, next_x, next_y = connected
-                used_segments.add(seg_idx)
-                chain.append((next_x, next_y))
-            else:
-                break
-
-        polylines.append(np.array(chain, dtype=np.float32))
+    for poly_mm in raw_polylines_mm:
+        x_px = canvas_cx + (poly_mm[:, 0] - dxf_cx) * px_per_mm
+        y_px = canvas_cy - (poly_mm[:, 1] - dxf_cy) * px_per_mm  # Y-flip
+        polylines.append(np.column_stack([x_px, y_px]).astype(np.float32))
 
     return Dxf(
         polylines=polylines,

@@ -96,17 +96,13 @@ def fit(
         raise ValueError("DXF polylines produced no sample points.")
 
     # Stride subsample — identical indices every call (no RNG)
-    dxf_sample = _stride_subsample(dxf_all, n=2000)
+    dxf_sample = _stride_subsample(dxf_all, n=4000)
 
     # ── Step 3: Centroids ─────────────────────────────────────────────
-    dxf_filled = np.zeros((H, W), np.uint8)
-    for poly in polylines:
-        if len(poly) >= 3:
-            cv2.fillPoly(dxf_filled, [poly.astype(np.int32).reshape(-1, 1, 2)], 255)
-
-    M_dxf = cv2.moments(dxf_filled)
-    dxf_cx = float(M_dxf["m10"] / max(M_dxf["m00"], 1))
-    dxf_cy = float(M_dxf["m01"] / max(M_dxf["m00"], 1))
+    # Use the mean of all sampled DXF points as centroid (robust for open
+    # entities like individual arcs/lines which don't form closed polygons).
+    dxf_cx = float(dxf_all[:, 0].mean())
+    dxf_cy = float(dxf_all[:, 1].mean())
 
     M_scene = cv2.moments(silhouette_mask)
     scene_cx = float(M_scene["m10"] / max(M_scene["m00"], 1))
