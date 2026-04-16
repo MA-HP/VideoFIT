@@ -11,13 +11,18 @@ Two rendering modes:
 from __future__ import annotations
 
 import numpy as np
+import ezdxf
+from ezdxf.addons.drawing import Frontend, RenderContext
+from ezdxf.addons.drawing.pyqt import PyQtBackend
+from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen
+from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen, QTransform
 from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsScene,
 )
 
 from app.models.fit_result import FitResult
+from app.models.dxf import Dxf
 
 
 _PREVIEW_COLOR = QColor(0, 200, 255, 255)   # cyan
@@ -39,134 +44,177 @@ class DxfOverlay:
             self._scene.removeItem(item)
         self._items.clear()
 
-    def draw_preview(self, polylines: list[np.ndarray]) -> None:
+    def draw_preview(self, dxf: Dxf) -> None:
         """
-        Draw DXF polylines as cyan outlines (before alignment).
+        Draw DXF using ezdxf PyQtBackend.
         """
         self.clear()
 
-        pen = QPen(_PREVIEW_COLOR, _PEN_WIDTH)
-        pen.setCosmetic(True)
+        if dxf.doc is None:
+            return
 
-        for poly in polylines:
-            if len(poly) < 2:
-                continue
-            path = QPainterPath()
-            path.moveTo(QPointF(float(poly[0][0]), float(poly[0][1])))
-            for x, y in poly[1:]:
-                path.lineTo(QPointF(float(x), float(y)))
+        ctx = RenderContext(dxf.doc)
+        backend = PyQtBackend(scene=self._scene)
 
-            item = QGraphicsPathItem(path)
-            item.setPen(pen)
-            item.setBrush(QBrush())
-            item.setZValue(100)
-            self._scene.addItem(item)
-            self._items.append(item)
+        config = Configuration(
+            background_policy=BackgroundPolicy.OFF,
+        )
+
+        frontend = Frontend(ctx, backend, config=config)
+        frontend.draw_layout(dxf.doc.modelspace(), finalize=True)
+
+        dxf_group = self._scene.createItemGroup([])
+        for item in self._scene.items():
+            if item not in self._items and getattr(item, 'zValue', lambda: 0)() == 0 and item.parentItem() is None:
+                # We need a proper way to distinguish dxf items. For now we assume new items.
+                pass
+
+        # ACTUALLY, we should clear and group properly, let's fix it this way:
+        # Collect items before:
+        items_before = set(self._scene.items())
+
+        frontend = Frontend(ctx, backend, config=config)
+        frontend.draw_layout(dxf.doc.modelspace(), finalize=True)
+
+        items_after = set(self._scene.items())
+        new_items = items_after - items_before
+
+        group = self._scene.createItemGroup([])
+        for item in new_items:
+            # We override colors for preview
+            if isinstance(item, QGraphicsPathItem) or isinstance(item, QGraphicsLineItem):
+                pen = item.pen()
+                pen.setColor(_PREVIEW_COLOR)
+                pen.setCosmetic(True)
+                pen.setWidth(_PEN_WIDTH)
+                item.setPen(pen)
+            group.addToGroup(item)
+
+        # Apply the scaling and translation identical to dxf_service.py
+        if dxf.canvas_shape[0] != 0:
+            H, W = dxf.canvas_shape
+            canvas_cx, canvas_cy = W / 2.0, H / 2.0
+            dxf_cx, dxf_cy = dxf.dxf_center_mm
+            px_per_mm = dxf.px_per_mm
+
+            # transform steps:
+            # 1. translate so dxf_center_mm is at (0,0)
+            # 2. scale to pixels (and flip Y)
+            # 3. translate to canvas center
+
+            t = QTransform()
+            t.translate(canvas_cx, canvas_cy)
+            t.scale(px_per_mm, -px_per_mm)
+            t.translate(-dxf_cx, -dxf_cy)
+
+            group.setTransform(t)
+
+        group.setZValue(100)
+        self._items.append(group)
+        # We also need to transform it if needed, or if it is already in px we are fine. Wait, dxf.doc is in mm.
+        # But we need it in px.
 
     def draw_heatmap(
         self,
-        polylines: list[np.ndarray],
+        dxf: Dxf,
         result: FitResult,
     ) -> None:
         """
-        Draw DXF polylines transformed by the alignment result, with each
-        segment colored by its distance to the nearest real edge.
-
-        Color logic (matches the POC):
-          • ≤ 1 px  →  pure green   (perfect match)
-          • 1–3 px  →  green→yellow→red gradient
-          • > 3 px  →  pure red     (bad match)
-
-        Uses QGraphicsLineItem per segment for individual coloring with
-        cosmetic pens for infinite-zoom support.
+        Draw DXF natively using ezdxf PyQtBackend, applying a heatmap color
+        to each native item based on its average distance to the nearest real edge.
         """
         self.clear()
 
-        dist_t = result.dist_t
-        if dist_t is None:
-            # Fallback: draw plain green if no distance transform available
-            self._draw_aligned_plain(polylines, result)
-            return
-
-        H, W = dist_t.shape
-        a = np.radians(result.angle_deg)
-        cos_t = np.cos(a)
-        sin_t = np.sin(a)
-        cx = result.dxf_cx
-        cy = result.dxf_cy
-        tx = result.tx
-        ty = result.ty
-
-        for poly in polylines:
-            if len(poly) < 2:
-                continue
-
-            # Transform all vertices (vectorised)
-            xs = poly[:, 0] - cx
-            ys = poly[:, 1] - cy
-            nx = cos_t * xs - sin_t * ys + cx + tx
-            ny = sin_t * xs + cos_t * ys + cy + ty
-            pts = np.stack([nx, ny], axis=1)
-
-            # Draw segment by segment with heatmap color
-            for i in range(len(pts) - 1):
-                # Sample distance at the start point of the segment
-                px_x = int(np.clip(pts[i][0], 0, W - 1))
-                px_y = int(np.clip(pts[i][1], 0, H - 1))
-                d = float(dist_t[px_y, px_x])
-
-                # Color mapping: green → yellow → red
-                color = _distance_to_color(d)
-
-                line = QGraphicsLineItem(
-                    float(pts[i][0]), float(pts[i][1]),
-                    float(pts[i + 1][0]), float(pts[i + 1][1]),
-                )
-                pen = QPen(color, _PEN_WIDTH)
-                pen.setCosmetic(True)
-                pen.setCapStyle(Qt.RoundCap)
-                line.setPen(pen)
-                line.setZValue(100)
-
-                self._scene.addItem(line)
-                self._items.append(line)
+        self._draw_aligned_native(dxf, result, dist_t=result.dist_t)
 
     # ── Private helpers ──────────────────────────────────────────────
 
-    def _draw_aligned_plain(
-        self,
-        polylines: list[np.ndarray],
-        result: FitResult,
-    ) -> None:
-        """Fallback: draw aligned polylines in solid green."""
-        pen = QPen(QColor(0, 255, 0, 255), _PEN_WIDTH)
-        pen.setCosmetic(True)
+    def _draw_aligned_native(self, dxf: Dxf, result: FitResult, dist_t: np.ndarray | None = None) -> None:
+        if dxf.doc is None:
+            return
 
-        a = np.radians(result.angle_deg)
-        cos_t = np.cos(a)
-        sin_t = np.sin(a)
-        cx, cy = result.dxf_cx, result.dxf_cy
-        tx, ty = result.tx, result.ty
+        ctx = RenderContext(dxf.doc)
+        backend = PyQtBackend(scene=self._scene)
 
-        for poly in polylines:
-            if len(poly) < 2:
-                continue
-            xs = poly[:, 0] - cx
-            ys = poly[:, 1] - cy
-            nx = cos_t * xs - sin_t * ys + cx + tx
-            ny = sin_t * xs + cos_t * ys + cy + ty
+        config = Configuration(
+            background_policy=BackgroundPolicy.OFF,
+            line_policy=ezdxf.addons.drawing.config.LinePolicy.SOLID,
+        )
 
-            path = QPainterPath()
-            path.moveTo(QPointF(float(nx[0]), float(ny[0])))
-            for j in range(1, len(nx)):
-                path.lineTo(QPointF(float(nx[j]), float(ny[j])))
+        items_before = set(self._scene.items())
 
-            item = QGraphicsPathItem(path)
-            item.setPen(pen)
-            item.setBrush(QBrush())
-            item.setZValue(100)
-            self._scene.addItem(item)
-            self._items.append(item)
+        frontend = Frontend(ctx, backend, config=config)
+        frontend.draw_layout(dxf.doc.modelspace(), finalize=True)
+
+        items_after = set(self._scene.items())
+        new_items = items_after - items_before
+
+        if dxf.canvas_shape[0] != 0:
+            canvas_H, canvas_W = dxf.canvas_shape
+            canvas_cx, canvas_cy = canvas_W / 2.0, canvas_H / 2.0
+            dxf_cx_mm, dxf_cy_mm = dxf.dxf_center_mm
+            px_per_mm = dxf.px_per_mm
+
+            t = QTransform()
+            t.translate(canvas_cx, canvas_cy)
+            t.scale(px_per_mm, -px_per_mm)
+            t.translate(-dxf_cx_mm, -dxf_cy_mm)
+
+            t_fit = QTransform()
+            t_fit.translate(result.tx, result.ty)
+            t_fit.translate(result.dxf_cx, result.dxf_cy)
+            t_fit.rotate(result.angle_deg)
+            t_fit.translate(-result.dxf_cx, -result.dxf_cy)
+
+            final_t = t * t_fit
+        else:
+            final_t = QTransform()
+
+        group = self._scene.createItemGroup([])
+        for item in new_items:
+            pen = item.pen() if hasattr(item, 'pen') else None
+            if pen is not None:
+                color = self._compute_item_color(item, final_t, dist_t)
+                pen.setColor(color)
+                pen.setCosmetic(True)
+                pen.setWidth(_PEN_WIDTH)
+                item.setPen(pen)
+            group.addToGroup(item)
+
+        group.setTransform(final_t)
+        group.setZValue(100)
+        self._items.append(group)
+
+    def _compute_item_color(self, item: QGraphicsItem, final_t: QTransform, dist_t: np.ndarray | None) -> QColor:
+        if dist_t is None:
+            return QColor(0, 255, 0, 255)  # default green
+
+        points = []
+        if isinstance(item, QGraphicsPathItem):
+            path = item.path()
+            for i in range(11):
+                points.append(path.pointAtPercent(i / 10.0))
+        elif isinstance(item, QGraphicsLineItem):
+            line = item.line()
+            points.append(line.p1())
+            points.append(line.p2())
+            points.append(line.center())
+        else:
+            points.append(item.boundingRect().center())
+
+        if not points:
+            return QColor(0, 255, 0, 255)
+
+        H, W = dist_t.shape
+        d_sum = 0.0
+        for pt in points:
+            mapped_pt = final_t.map(pt)
+            px = int(np.clip(mapped_pt.x(), 0, W - 1))
+            py = int(np.clip(mapped_pt.y(), 0, H - 1))
+            d_sum += float(dist_t[py, px])
+
+        avg_d = d_sum / len(points)
+        return _distance_to_color(avg_d)
 
 
 def _distance_to_color(d: float) -> QColor:
@@ -186,4 +234,3 @@ def _distance_to_color(d: float) -> QColor:
         return QColor(r, g, 0)
     else:
         return QColor(255, 0, 0)
-

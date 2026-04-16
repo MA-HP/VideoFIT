@@ -119,7 +119,7 @@ class ComparePresenter(QObject):
                   f"calibration={calibration:.2f} px/mm")
 
             # Show a preview overlay (un-aligned, raw pixel coords)
-            self._overlay.draw_preview(self._dxf_data.polylines)
+            self._overlay.draw_preview(self._dxf_data)
 
         except Exception as exc:
             print(f"Failed to load DXF: {exc}")
@@ -158,7 +158,7 @@ class ComparePresenter(QObject):
               f"inlier={result.inlier_frac * 100:.1f}%")
 
         self._overlay.draw_heatmap(
-            self._dxf_data.polylines,
+            self._dxf_data,
             result,
         )
 
@@ -189,4 +189,3 @@ class ComparePresenter(QObject):
     def clear_overlay(self) -> None:
         """Remove any existing overlay (e.g. when switching modes)."""
         self._overlay.clear()
-

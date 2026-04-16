@@ -18,7 +18,7 @@ from app.models.dxf import Dxf
 def load_dxf(
     filepath: str,
     px_per_mm: float,
-    canvas_shape: tuple[int, int] = (3648, 5472),
+    canvas_shape: tuple[int, int],
 ) -> Dxf:
     """
     Parse *filepath* and return pixel-space polylines centred on the canvas.
@@ -125,4 +125,7 @@ def load_dxf(
     return Dxf(
         polylines=polylines,
         dxf_center_mm=(float(dxf_cx), float(dxf_cy)),
+        doc=doc,
+        px_per_mm=px_per_mm,
+        canvas_shape=canvas_shape,
     )
