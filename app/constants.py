@@ -6,7 +6,7 @@ MARGIN = 20
 
 GLASS_STYLE = """
     QFrame#GlassPanel {
-        background-color: rgba(15, 15, 15, 180);
+        background-color: rgba(15, 15, 15, 210);
         border: 1px solid rgba(255, 255, 255, 25);
         border-radius: 12px;
     }
@@ -36,7 +36,7 @@ GLASS_STYLE = """
         color: white;
     }
     QLineEdit, QComboBox {
-        background-color: rgba(0, 0, 0, 150);
+        background-color: rgba(0, 0, 0, 210);
         border: 1px solid rgba(255, 255, 255, 20);
         border-radius: 5px;
         padding: 5px;
@@ -72,7 +72,7 @@ TITLE_BAR_STYLE = """
 SETTINGS_BTN_STYLE = GLASS_STYLE + """
     QPushButton {
         border-radius: 22px;
-        background-color: rgba(15, 15, 15, 180);
+        background-color: rgba(15, 15, 15, 210);
         border: 1px solid rgba(255, 255, 255, 25);
     }
     QPushButton:checked { background-color: rgba(255, 255, 255, 30); }
