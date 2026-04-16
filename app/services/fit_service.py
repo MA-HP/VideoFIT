@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from scipy.ndimage import map_coordinates
 from scipy.optimize import minimize
 
 from app.models.fit_result import FitResult
@@ -43,7 +44,10 @@ def fit(
         Rigid-body transform (tx, ty, angle) that aligns the DXF to the piece.
     """
     H, W = distance_field.shape
-    dist_t = distance_field
+    # Smooth the distance field to eliminate noisy local minima
+    # that cause the optimizer to settle at slightly different spots each run
+    from scipy.ndimage import gaussian_filter
+    dist_t = gaussian_filter(distance_field.astype(np.float32), sigma=1.5)
 
     # ── Step 1: Rasterise DXF polylines → sample edge points ─────────
     dxf_edge_img = np.zeros((H, W), dtype=np.uint8)
@@ -89,12 +93,14 @@ def fit(
         sin_t = np.sin(theta)
         xs = dxf_sample[:, 0] - dxf_cx
         ys = dxf_sample[:, 1] - dxf_cy
-        nx = (cos_t * xs - sin_t * ys + dxf_cx + tx).astype(int)
-        ny = (sin_t * xs + cos_t * ys + dxf_cy + ty).astype(int)
+        nx = cos_t * xs - sin_t * ys + dxf_cx + tx   # float coords
+        ny = sin_t * xs + cos_t * ys + dxf_cy + ty   # float coords
         valid = (nx >= 0) & (nx < W) & (ny >= 0) & (ny < H)
         if valid.sum() < 10:
             return 1e6
-        return float(dist_t[ny[valid], nx[valid]].mean())
+        # Bilinear interpolation → smooth, continuous surface (no quantisation steps)
+        costs = map_coordinates(dist_t, [ny[valid], nx[valid]], order=1, mode="nearest")
+        return float(costs.mean())
 
     # ── Step 4: Coarse angle sweep (72 candidates) — keep top 3 ──────
     sweep_results = []
