@@ -16,7 +16,7 @@ from ezdxf.addons.drawing import Frontend, RenderContext
 from ezdxf.addons.drawing.pyqt import PyQtBackend
 from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen, QTransform
+from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QTransform
 from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsScene,
 )
@@ -170,12 +170,16 @@ class DxfOverlay:
         else:
             final_t = QTransform()
 
+        if dist_t is not None:
+            brush = self._create_heatmap_brush(dist_t, final_t)
+        else:
+            brush = QBrush(QColor(0, 255, 0, 255))
+
         group = self._scene.createItemGroup([])
         for item in new_items:
             pen = item.pen() if hasattr(item, 'pen') else None
             if pen is not None:
-                color = self._compute_item_color(item, final_t, dist_t)
-                pen.setColor(color)
+                pen.setBrush(brush)
                 pen.setCosmetic(True)
                 pen.setWidth(_PEN_WIDTH)
                 item.setPen(pen)
@@ -185,37 +189,49 @@ class DxfOverlay:
         group.setZValue(100)
         self._items.append(group)
 
-    def _compute_item_color(self, item: QGraphicsItem, final_t: QTransform, dist_t: np.ndarray | None) -> QColor:
-        if dist_t is None:
-            return QColor(0, 255, 0, 255)  # default green
-
-        points = []
-        if isinstance(item, QGraphicsPathItem):
-            path = item.path()
-            for i in range(11):
-                points.append(path.pointAtPercent(i / 10.0))
-        elif isinstance(item, QGraphicsLineItem):
-            line = item.line()
-            points.append(line.p1())
-            points.append(line.p2())
-            points.append(line.center())
-        else:
-            points.append(item.boundingRect().center())
-
-        if not points:
-            return QColor(0, 255, 0, 255)
-
+    def _create_heatmap_brush(self, dist_t: np.ndarray, final_t: QTransform) -> QBrush:
         H, W = dist_t.shape
-        d_sum = 0.0
-        for pt in points:
-            mapped_pt = final_t.map(pt)
-            px = int(np.clip(mapped_pt.x(), 0, W - 1))
-            py = int(np.clip(mapped_pt.y(), 0, H - 1))
-            d_sum += float(dist_t[py, px])
 
-        avg_d = d_sum / len(points)
-        return _distance_to_color(avg_d)
+        # Vectorized color mapping
+        d = dist_t.astype(np.float32)
 
+        # <= 1.0 -> Green (0, 255, 0)
+        # 1.0 to 3.0 -> Green to Red (t=(d-1)/2, r=255*t, g=255*(1-t))
+        # > 3.0 -> Red (255, 0, 0)
+
+        t = np.clip((d - 1.0) / 2.0, 0.0, 1.0)
+
+        r = (255.0 * t).astype(np.uint8)
+        g = (255.0 * (1.0 - t)).astype(np.uint8)
+        b = np.zeros_like(r)
+        a = np.full_like(r, 255)
+
+        img_data = np.stack([r, g, b, a], axis=-1)
+
+        # Garantir que le bloc de mémoire est contigu pour QImage afin d'éviter tout crash
+        self._heatmap_img_data = np.ascontiguousarray(img_data)
+
+        qimg = QImage(
+            self._heatmap_img_data.data,
+            W, H,
+            W * 4,
+            QImage.Format.Format_RGBA8888
+        )
+
+        brush = QBrush(qimg)
+        # The brush texture space is identically the canvas pixel space (0..W, 0..H).
+        # The item being drawn is in "DXF native space".
+        # When the user draws at local native (0,0), it transforms to scene QTransform(final_t) -> (X,Y) scene pixel.
+        # But QBrush uses its own transform from Texture -> Item Local space!
+        # If we want Texture Space (Canvas pixels) to exactly align with Scene Space (Canvas pixels),
+        # Texture Space = Item Local Space * final_t.
+        # Thus the brush transform from Texture Space to Item Local Space is the INVERSE of final_t!
+
+        inv_t, invertible = final_t.inverted()
+        if invertible:
+            brush.setTransform(inv_t)
+
+        return brush
 
 def _distance_to_color(d: float) -> QColor:
     """
