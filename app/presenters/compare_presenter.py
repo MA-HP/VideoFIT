@@ -48,8 +48,9 @@ class _FitWorker(QRunnable):
             # Fit (polylines are already in pixel space)
             result = fit(
                 polylines=self.dxf_data.polylines,
-                distance_field=edge_result.distance_field,
+                edge_points=edge_result.edge_points,
                 silhouette_mask=edge_result.mask,
+                distance_field=edge_result.distance_field,
             )
             self.signals.finished.emit(result)
         except Exception as exc:
