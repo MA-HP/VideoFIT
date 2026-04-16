@@ -158,9 +158,12 @@ class ComparePresenter(QObject):
               f"angle={result.angle_deg:.2f}°  cost={result.cost:.2f}  "
               f"inlier={result.inlier_frac * 100:.1f}%")
 
+        px_per_mm = self._dxf_data.px_per_mm
         self._overlay.draw_heatmap(
             self._dxf_data,
             result,
+            heatmap_min=self._active_heatmap_min() * px_per_mm,
+            heatmap_max=self._active_heatmap_max() * px_per_mm,
         )
 
         self._toolbar.btn_run_compare.setEnabled(True)
@@ -175,17 +178,28 @@ class ComparePresenter(QObject):
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _active_calibration(self) -> float:
-        """Return the calibration value for the currently selected camera."""
+        """Return the calibration from appsettings for the currently selected camera."""
         try:
-            text = self._settings_panel.input_calibration.text()
-            return float(text)
-        except (ValueError, AttributeError):
+            idx = self._settings_panel.combo_camera.currentIndex()
+            return float(self._settings.cameras[idx].calibration_px_mm)
+        except (IndexError, ValueError):
             pass
-        # Fallback: first camera in settings
         try:
             return float(self._settings.cameras[0].calibration_px_mm)
         except (IndexError, ValueError):
             return 0.0
+
+    def _active_heatmap_min(self) -> float:
+        try:
+            return float(self._settings_panel.input_heatmap_min.text())
+        except (ValueError, AttributeError):
+            return 1.0
+
+    def _active_heatmap_max(self) -> float:
+        try:
+            return float(self._settings_panel.input_heatmap_max.text())
+        except (ValueError, AttributeError):
+            return 3.0
 
     def clear_overlay(self) -> None:
         """Remove any existing overlay (e.g. when switching modes)."""

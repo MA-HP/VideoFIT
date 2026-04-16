@@ -118,18 +118,24 @@ class DxfOverlay:
         self,
         dxf: Dxf,
         result: FitResult,
+        heatmap_min: float = 1.0,
+        heatmap_max: float = 3.0,
     ) -> None:
         """
         Draw DXF natively using ezdxf PyQtBackend, applying a heatmap color
         to each native item based on its average distance to the nearest real edge.
+        Green = ≤ heatmap_min px,  Red = ≥ heatmap_max px.
         """
         self.clear()
-
-        self._draw_aligned_native(dxf, result, dist_t=result.dist_t)
+        self._draw_aligned_native(dxf, result, dist_t=result.dist_t,
+                                  heatmap_min=heatmap_min, heatmap_max=heatmap_max)
 
     # ── Private helpers ──────────────────────────────────────────────
 
-    def _draw_aligned_native(self, dxf: Dxf, result: FitResult, dist_t: np.ndarray | None = None) -> None:
+    def _draw_aligned_native(self, dxf: Dxf, result: FitResult,
+                              dist_t: np.ndarray | None = None,
+                              heatmap_min: float = 1.0,
+                              heatmap_max: float = 3.0) -> None:
         if dxf.doc is None:
             return
 
@@ -171,7 +177,9 @@ class DxfOverlay:
             final_t = QTransform()
 
         if dist_t is not None:
-            brush = self._create_heatmap_brush(dist_t, final_t)
+            brush = self._create_heatmap_brush(dist_t, final_t,
+                                               heatmap_min=heatmap_min,
+                                               heatmap_max=heatmap_max)
         else:
             brush = QBrush(QColor(0, 255, 0, 255))
 
@@ -189,17 +197,16 @@ class DxfOverlay:
         group.setZValue(100)
         self._items.append(group)
 
-    def _create_heatmap_brush(self, dist_t: np.ndarray, final_t: QTransform) -> QBrush:
+    def _create_heatmap_brush(self, dist_t: np.ndarray, final_t: QTransform,
+                               heatmap_min: float = 1.0,
+                               heatmap_max: float = 3.0) -> QBrush:
         H, W = dist_t.shape
 
-        # Vectorized color mapping
         d = dist_t.astype(np.float32)
 
-        # <= 1.0 -> Green (0, 255, 0)
-        # 1.0 to 3.0 -> Green to Red (t=(d-1)/2, r=255*t, g=255*(1-t))
-        # > 3.0 -> Red (255, 0, 0)
-
-        t = np.clip((d - 1.0) / 2.0, 0.0, 1.0)
+        # t=0 → green (≤ heatmap_min),  t=1 → red (≥ heatmap_max)
+        span = max(heatmap_max - heatmap_min, 1e-6)
+        t = np.clip((d - heatmap_min) / span, 0.0, 1.0)
 
         r = (255.0 * t).astype(np.uint8)
         g = (255.0 * (1.0 - t)).astype(np.uint8)
@@ -233,20 +240,16 @@ class DxfOverlay:
 
         return brush
 
-def _distance_to_color(d: float) -> QColor:
+def _distance_to_color(d: float, heatmap_min: float = 1.0, heatmap_max: float = 3.0) -> QColor:
     """
     Map a distance-transform value to a heatmap color.
 
-      ≤ 1.0 px  →  pure green  (0, 255, 0)
-      1–3 px    →  green → yellow → red gradient
-      > 3.0 px  →  pure red    (255, 0, 0)
+      ≤ heatmap_min px  →  pure green  (0, 255, 0)
+      min … max px      →  green → yellow → red gradient
+      ≥ heatmap_max px  →  pure red    (255, 0, 0)
     """
-    if d <= 1.0:
-        return QColor(0, 255, 0)
-    elif d <= 3.0:
-        t = (d - 1.0) / 2.0          # 0.0 → 1.0
-        r = int(255 * t)
-        g = int(255 * (1.0 - t))
-        return QColor(r, g, 0)
-    else:
-        return QColor(255, 0, 0)
+    span = max(heatmap_max - heatmap_min, 1e-6)
+    t = max(0.0, min(1.0, (d - heatmap_min) / span))
+    r = int(255 * t)
+    g = int(255 * (1.0 - t))
+    return QColor(r, g, 0)

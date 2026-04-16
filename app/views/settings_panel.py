@@ -19,15 +19,17 @@ class SettingsPanel(QFrame):
         layout.setSpacing(10)
 
         # Expose widgets for presenters to manipulate
-        self.input_calibration = QLineEdit("0.000")
         self.combo_comparison = QComboBox()
         self.combo_comparison.addItems(["Best Fit", "Complete"])
         self.combo_camera = QComboBox()
+        self.input_heatmap_min = QLineEdit("0.1")
+        self.input_heatmap_max = QLineEdit("0.5")
 
         rows = [
-            ("Calibration (px/mm):", self.input_calibration),
             ("Comparison Mode:", self.combo_comparison),
             ("Camera:", self.combo_camera),
+            ("Heatmap min error (mm):", self.input_heatmap_min),
+            ("Heatmap max error (mm):", self.input_heatmap_max),
         ]
         for row, (label_text, widget) in enumerate(rows):
             layout.addWidget(QLabel(label_text), row, 0)
@@ -35,4 +37,3 @@ class SettingsPanel(QFrame):
 
         self.adjustSize()
         self.hide()
-

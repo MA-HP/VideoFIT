@@ -17,6 +17,8 @@ class CameraInfo:
     serial: str = ""
     config_file: str = ""
     calibration_px_mm: str = "0.0"
+    heatmap_min_error: float = 0.1   # mm — below this = fully green
+    heatmap_max_error: float = 0.5   # mm — above this = fully red
 
 
 @dataclass
@@ -53,6 +55,8 @@ class AppSettings:
                     serial=c.get("serial", ""),
                     config_file=c.get("config_file", ""),
                     calibration_px_mm=c.get("calibration_px_mm", "0.0"),
+                    heatmap_min_error=float(c.get("heatmap_min_error", 1.0)),
+                    heatmap_max_error=float(c.get("heatmap_max_error", 3.0)),
                 )
                 for c in raw.get("cameras", [])
             ]

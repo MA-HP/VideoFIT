@@ -57,8 +57,9 @@ class CameraPresenter(QObject):
 
         cam_info = cameras[index]
 
-        # Update calibration in the view
-        self._panel.input_calibration.setText(str(cam_info.calibration_px_mm))
+        # Update heatmap thresholds for this camera
+        self._panel.input_heatmap_min.setText(str(cam_info.heatmap_min_error))
+        self._panel.input_heatmap_max.setText(str(cam_info.heatmap_max_error))
 
         # Resolve config path
         config_path = None
