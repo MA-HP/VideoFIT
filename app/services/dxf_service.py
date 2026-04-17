@@ -44,6 +44,7 @@ def load_dxf(
     # boundaries is crucial for "points of interest" in Complete mode and gives
     # the optimizer many more independently-shaped features to lock onto.
     raw_polylines_mm: list[np.ndarray] = []
+    raw_layers: list[str] = []   # layer name per polyline (upper-cased)
 
     def iter_all_entities(layout):
         for e in layout:
@@ -64,6 +65,8 @@ def load_dxf(
             raw_polylines_mm.append(
                 np.array([[q.x, q.y] for q in pts], dtype=np.float32)
             )
+            layer = getattr(e.dxf, "layer", "GLOBAL").upper()
+            raw_layers.append(layer)
         except (TypeError, Exception):
             continue
 
@@ -80,10 +83,18 @@ def load_dxf(
     canvas_cx, canvas_cy = W / 2.0, H / 2.0
 
     polylines: list[np.ndarray] = []
-    for poly_mm in raw_polylines_mm:
+    polylines_global: list[np.ndarray] = []
+    polylines_refine: list[np.ndarray] = []
+    for i, poly_mm in enumerate(raw_polylines_mm):
         x_px = canvas_cx + (poly_mm[:, 0] - dxf_cx) * px_per_mm
         y_px = canvas_cy - (poly_mm[:, 1] - dxf_cy) * px_per_mm  # Y-flip
-        polylines.append(np.column_stack([x_px, y_px]).astype(np.float32))
+        poly_px = np.column_stack([x_px, y_px]).astype(np.float32)
+        polylines.append(poly_px)
+        layer = raw_layers[i]
+        if layer == "REFINE":
+            polylines_refine.append(poly_px)
+        else:
+            polylines_global.append(poly_px)
 
     return Dxf(
         polylines=polylines,
@@ -91,4 +102,6 @@ def load_dxf(
         doc=doc,
         px_per_mm=px_per_mm,
         canvas_shape=canvas_shape,
+        polylines_global=polylines_global,
+        polylines_refine=polylines_refine,
     )

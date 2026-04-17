@@ -189,3 +189,132 @@ def fit(
         inlier_frac=inlier_frac,
         dist_t=dist_t,
     )
+
+
+# ======================================================================
+# Complete mode — 3-step pipeline (GLOBAL+REFINE → GLOBAL+REFINE → REFINE)
+# ======================================================================
+
+def _refine_from(
+    polylines: list[np.ndarray],
+    init_params: np.ndarray,
+    dist_t: np.ndarray,
+    n_sample: int = 4000,
+    maxiter: int = 20_000,
+) -> tuple:
+    """
+    Run a single Powell refinement starting from *init_params* on the given
+    polylines set. Returns (optimized_params, cost, dxf_cx, dxf_cy).
+    """
+    H, W = dist_t.shape
+    dxf_all = _sample_polylines(polylines, spacing=0.5)
+    if len(dxf_all) == 0:
+        raise ValueError("Polylines produced no sample points.")
+
+    dxf_sample = _stride_subsample(dxf_all, n=n_sample)
+    dxf_cx = float(dxf_all[:, 0].mean())
+    dxf_cy = float(dxf_all[:, 1].mean())
+    dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
+
+    _OOB_DIST = float(max(H, W))
+    _n_keep = max(1, int(len(dxf_sample) * (1.0 - _TRIM_FRAC)))
+    _all_vals = np.empty(len(dxf_c), dtype=np.float64)
+
+    def cost_fn(params):
+        tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        nx = cos_t * dxf_c[:, 0] - sin_t * dxf_c[:, 1] + dxf_cx + tx
+        ny = sin_t * dxf_c[:, 0] + cos_t * dxf_c[:, 1] + dxf_cy + ty
+        in_b = (nx >= 0) & (nx < W - 1) & (ny >= 0) & (ny < H - 1)
+        _all_vals[:] = _OOB_DIST
+        if in_b.sum() < 10:
+            return _OOB_DIST
+        _all_vals[in_b] = map_coordinates(
+            dist_t, [ny[in_b], nx[in_b]], order=1, mode="nearest", prefilter=False
+        )
+        _all_vals.sort()
+        return float(_all_vals[:_n_keep].mean())
+
+    res = minimize(
+        cost_fn,
+        init_params.astype(np.float64),
+        method="Powell",
+        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": maxiter},
+    )
+    return res.x, res.fun, dxf_cx, dxf_cy
+
+
+def fit_complete(
+    polylines_all: list[np.ndarray],
+    polylines_refine: list[np.ndarray],
+    edge_points: np.ndarray,
+    silhouette_mask: np.ndarray,
+    distance_field: np.ndarray | None = None,
+) -> FitResult:
+    """
+    Complete mode: 3-step pipeline for higher precision on REFINE-layer entities.
+
+    Step 1 — Coarse:   angle sweep + Powell on ALL layers (GLOBAL + REFINE).
+    Step 2 — Refine:   Powell from Step 1 result on ALL layers.
+    Step 3 — Finetune: Powell from Step 2 result on REFINE layer only.
+    """
+    if distance_field is None:
+        raise ValueError("distance_field is required for fitting.")
+
+    # ── Step 1: Coarse fit on all layers (same as best-fit) ───────────
+    result_coarse = fit(
+        polylines=polylines_all,
+        edge_points=edge_points,
+        silhouette_mask=silhouette_mask,
+        distance_field=distance_field,
+    )
+    dist_t = result_coarse.dist_t
+
+    # Convert step 1 result back to optimiser param space
+    angle_rad = np.radians(result_coarse.angle_deg)
+    params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
+
+    # ── Step 2: Refine on all layers starting from coarse result ──────
+    params_2, cost_2, dxf_cx_2, dxf_cy_2 = _refine_from(
+        polylines_all, params_1, dist_t, n_sample=6000,
+    )
+
+    # ── Step 3: Finetune on REFINE layer only ─────────────────────────
+    if polylines_refine:
+        params_3, cost_3, dxf_cx_3, dxf_cy_3 = _refine_from(
+            polylines_refine, params_2, dist_t, n_sample=6000,
+        )
+    else:
+        # No REFINE layer — fall back to step 2 result
+        params_3, cost_3, dxf_cx_3, dxf_cy_3 = params_2, cost_2, dxf_cx_2, dxf_cy_2
+
+    tx_opt, ty_opt, angle_opt = params_3
+    H, W = dist_t.shape
+
+    # ── Inlier fraction (on ALL polylines, threshold = 2 px) ──────────
+    all_pts = _sample_polylines(polylines_all, spacing=1.0)
+    dxf_cx_all = float(all_pts[:, 0].mean())
+    dxf_cy_all = float(all_pts[:, 1].mean())
+    all_c = (all_pts - np.array([dxf_cx_all, dxf_cy_all], dtype=np.float32)).astype(np.float64)
+    cos_t, sin_t = np.cos(angle_opt), np.sin(angle_opt)
+    nx_all = cos_t * all_c[:, 0] - sin_t * all_c[:, 1] + dxf_cx_all + tx_opt
+    ny_all = sin_t * all_c[:, 0] + cos_t * all_c[:, 1] + dxf_cy_all + ty_opt
+    valid_all = (nx_all >= 0) & (nx_all < W - 1) & (ny_all >= 0) & (ny_all < H - 1)
+    if valid_all.sum() > 0:
+        vals = map_coordinates(dist_t, [ny_all[valid_all], nx_all[valid_all]],
+                               order=1, mode="nearest", prefilter=False)
+        inlier_frac = float(np.mean(vals < 2.0))
+    else:
+        inlier_frac = 0.0
+
+    return FitResult(
+        tx=float(tx_opt),
+        ty=float(ty_opt),
+        angle_deg=float(np.degrees(angle_opt)),
+        cost=float(cost_3),
+        dxf_cx=dxf_cx_3,
+        dxf_cy=dxf_cy_3,
+        inlier_frac=inlier_frac,
+        dist_t=dist_t,
+    )
+

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QFileDialog
 from app.models.dxf import Dxf
 from app.services.dxf_service import load_dxf
 from app.services.edge_service import compute_edges
-from app.services.fit_service import fit
+from app.services.fit_service import fit, fit_complete
 from app.models.settings import AppSettings
 from app.views.debug_window import DebugPreprocessingWindow
 from app.views.dxf_overlay import DxfOverlay
@@ -32,13 +32,14 @@ class _FitSignals(QObject):
 
 
 class _FitWorker(QRunnable):
-    """Runs the heavy edge-detection + Nelder-Mead pipeline off the UI thread."""
+    """Runs the heavy edge-detection + fitting pipeline off the UI thread."""
 
-    def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf, debug: bool = False) -> None:
+    def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf, debug: bool = False, mode: str = "Best Fit") -> None:
         super().__init__()
         self.frame_bgr = frame_bgr
         self.dxf_data = dxf_data
         self.debug = debug
+        self.mode = mode
         self.signals = _FitSignals()
 
     def run(self) -> None:
@@ -50,13 +51,21 @@ class _FitWorker(QRunnable):
                 edge_result = compute_edges(self.frame_bgr)
                 stages = None
 
-            # Fit (polylines are already in pixel space)
-            result = fit(
-                polylines=self.dxf_data.polylines,
-                edge_points=edge_result.edge_points,
-                silhouette_mask=edge_result.mask,
-                distance_field=edge_result.distance_field,
-            )
+            if self.mode == "Complete":
+                result = fit_complete(
+                    polylines_all=self.dxf_data.polylines,
+                    polylines_refine=self.dxf_data.polylines_refine,
+                    edge_points=edge_result.edge_points,
+                    silhouette_mask=edge_result.mask,
+                    distance_field=edge_result.distance_field,
+                )
+            else:
+                result = fit(
+                    polylines=self.dxf_data.polylines,
+                    edge_points=edge_result.edge_points,
+                    silhouette_mask=edge_result.mask,
+                    distance_field=edge_result.distance_field,
+                )
             self.signals.finished.emit((result, stages) if self.debug else result)
         except Exception as exc:
             import traceback
@@ -156,7 +165,8 @@ class ComparePresenter(QObject):
 
         debug = (self._debug_enabled
                  and self._settings_panel.chk_debug.isChecked())
-        worker = _FitWorker(frame_bgr.copy(), self._dxf_data, debug=debug)
+        mode = self._settings_panel.combo_comparison.currentText()
+        worker = _FitWorker(frame_bgr.copy(), self._dxf_data, debug=debug, mode=mode)
         worker.signals.finished.connect(self._on_fit_done)
         worker.signals.error.connect(self._on_fit_error)
         worker.setAutoDelete(True)
