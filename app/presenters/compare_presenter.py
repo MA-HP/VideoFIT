@@ -13,12 +13,12 @@ import numpy as np
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtWidgets import QFileDialog
 
-from app.models.fit_result import FitResult
 from app.models.dxf import Dxf
 from app.services.dxf_service import load_dxf
 from app.services.edge_service import compute_edges
 from app.services.fit_service import fit
 from app.models.settings import AppSettings
+from app.views.debug_window import DebugPreprocessingWindow
 from app.views.dxf_overlay import DxfOverlay
 from app.views.image_viewer import ImageViewer
 from app.views.settings_panel import SettingsPanel
@@ -27,23 +27,28 @@ from app.views.toolbar import Toolbar
 
 class _FitSignals(QObject):
     """Signals emitted by the background fitting worker."""
-    finished = Signal(object)   # FitResult
+    finished = Signal(object)   # FitResult or (FitResult, stages_dict)
     error = Signal(str)
 
 
 class _FitWorker(QRunnable):
     """Runs the heavy edge-detection + Nelder-Mead pipeline off the UI thread."""
 
-    def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf) -> None:
+    def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf, debug: bool = False) -> None:
         super().__init__()
         self.frame_bgr = frame_bgr
         self.dxf_data = dxf_data
+        self.debug = debug
         self.signals = _FitSignals()
 
     def run(self) -> None:
         try:
             # Edge detection (expects BGR)
-            edge_result = compute_edges(self.frame_bgr)
+            if self.debug:
+                edge_result, stages = compute_edges(self.frame_bgr, capture_stages=True)
+            else:
+                edge_result = compute_edges(self.frame_bgr)
+                stages = None
 
             # Fit (polylines are already in pixel space)
             result = fit(
@@ -52,7 +57,7 @@ class _FitWorker(QRunnable):
                 silhouette_mask=edge_result.mask,
                 distance_field=edge_result.distance_field,
             )
-            self.signals.finished.emit(result)
+            self.signals.finished.emit((result, stages) if self.debug else result)
         except Exception as exc:
             import traceback
             self.signals.error.emit(traceback.format_exc())
@@ -70,6 +75,7 @@ class ComparePresenter(QObject):
         viewer: ImageViewer,
         toolbar: Toolbar,
         settings_panel: SettingsPanel,
+        debug: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -77,14 +83,18 @@ class ComparePresenter(QObject):
         self._viewer = viewer
         self._toolbar = toolbar
         self._settings_panel = settings_panel
+        self._debug_enabled = debug
 
         self._dxf_data: Dxf | None = None
         self._overlay = DxfOverlay(self._viewer._scene)
         self._pool = QThreadPool.globalInstance()
+        self._debug_window = DebugPreprocessingWindow() if debug else None
 
         # Wire toolbar buttons
         self._toolbar.btn_load.clicked.connect(self._on_load)
         self._toolbar.btn_run_compare.clicked.connect(self._on_run)
+        if debug:
+            self._settings_panel.chk_debug.toggled.connect(self._on_debug_toggled)
 
     # ── Slots ────────────────────────────────────────────────────────
 
@@ -144,7 +154,9 @@ class ComparePresenter(QObject):
         self._toolbar.btn_run_compare.setEnabled(False)
         self._toolbar.btn_run_compare.setText(" Running…")
 
-        worker = _FitWorker(frame_bgr.copy(), self._dxf_data)
+        debug = (self._debug_enabled
+                 and self._settings_panel.chk_debug.isChecked())
+        worker = _FitWorker(frame_bgr.copy(), self._dxf_data, debug=debug)
         worker.signals.finished.connect(self._on_fit_done)
         worker.signals.error.connect(self._on_fit_error)
         worker.setAutoDelete(True)
@@ -153,10 +165,17 @@ class ComparePresenter(QObject):
     # ── Callbacks ────────────────────────────────────────────────────
 
     @Slot(object)
-    def _on_fit_done(self, result: FitResult) -> None:
-        print(f"Fit complete — tx={result.tx:+.1f}  ty={result.ty:+.1f}  "
-              f"angle={result.angle_deg:.2f}°  cost={result.cost:.2f}  "
-              f"inlier={result.inlier_frac * 100:.1f}%")
+    def _on_fit_done(self, payload) -> None:
+        # payload is FitResult (normal) or (FitResult, stages_dict) in debug mode
+        if isinstance(payload, tuple):
+            result, stages = payload
+        else:
+            result, stages = payload, None
+
+        fit_info = (f"tx={result.tx:+.1f}  ty={result.ty:+.1f}  "
+                    f"angle={result.angle_deg:.2f}°  cost={result.cost:.2f}  "
+                    f"inlier={result.inlier_frac * 100:.1f}%")
+        print(f"Fit complete — {fit_info}")
 
         px_per_mm = self._dxf_data.px_per_mm
         self._overlay.draw_heatmap(
@@ -166,6 +185,10 @@ class ComparePresenter(QObject):
             heatmap_max=self._active_heatmap_max() * px_per_mm,
         )
 
+        # Update debug window if stages were captured
+        if stages is not None and self._debug_window is not None:
+            self._debug_window.update_stages(stages, fit_info=fit_info)
+
         self._toolbar.btn_run_compare.setEnabled(True)
         self._toolbar.btn_run_compare.setText(" Run")
 
@@ -174,6 +197,17 @@ class ComparePresenter(QObject):
         print(f"Fit failed:\n{msg}")
         self._toolbar.btn_run_compare.setEnabled(True)
         self._toolbar.btn_run_compare.setText(" Run")
+
+    @Slot(bool)
+    def _on_debug_toggled(self, checked: bool) -> None:
+        """Show/hide the debug window when the Settings checkbox is toggled."""
+        if self._debug_window is None:
+            return
+        if checked:
+            self._debug_window.show()
+            self._debug_window.raise_()
+        else:
+            self._debug_window.hide()
 
     # ── Helpers ──────────────────────────────────────────────────────
 

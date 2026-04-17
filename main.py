@@ -11,6 +11,11 @@ from PySide6.QtWidgets import QApplication
 
 from app.orchestrator import AppOrchestrator
 
+# ── Developer flag ────────────────────────────────────────────────────────────
+# Set to True to enable the Debug Preprocessing panel in the Settings menu.
+# Leave False for production / end-user builds.
+DEBUG = True
+
 
 def main() -> None:
     ic4.Library.init(api_log_level=ic4.LogLevel.INFO, log_targets=ic4.LogTarget.STDERR)
@@ -20,7 +25,7 @@ def main() -> None:
         qt_app.setStyle("Fusion")
         qt_app.setFont(QFont("Segoe UI", 10))
 
-        orchestrator = AppOrchestrator()
+        orchestrator = AppOrchestrator(debug=DEBUG)
         orchestrator.show()
 
         exit_code = qt_app.exec()

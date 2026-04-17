@@ -3,7 +3,7 @@ VideoFIT — Settings Panel
 Glass-morphism floating panel with calibration, comparison and camera controls.
 """
 
-from PySide6.QtWidgets import QComboBox, QFrame, QGridLayout, QLabel, QLineEdit, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QFrame, QGridLayout, QLabel, QLineEdit, QWidget
 
 from app.constants import GLASS_STYLE
 
@@ -35,5 +35,26 @@ class SettingsPanel(QFrame):
             layout.addWidget(QLabel(label_text), row, 0)
             layout.addWidget(widget, row, 1)
 
+        # Debug checkbox — only made visible when DEBUG=True in main.py
+        self._debug_row = len(rows)
+        self._lbl_debug = QLabel("Debug preprocessing:")
+        self.chk_debug = QCheckBox()
+        self.chk_debug.setToolTip(
+            "Show the intermediate preprocessing images after each fit"
+        )
+        layout.addWidget(self._lbl_debug, self._debug_row, 0)
+        layout.addWidget(self.chk_debug, self._debug_row, 1)
+        # Hidden until explicitly enabled
+        self._lbl_debug.hide()
+        self.chk_debug.hide()
+
         self.adjustSize()
         self.hide()
+
+    # ------------------------------------------------------------------
+
+    def enable_debug_option(self) -> None:
+        """Make the debug checkbox visible (called when DEBUG=True in main.py)."""
+        self._lbl_debug.show()
+        self.chk_debug.show()
+        self.adjustSize()

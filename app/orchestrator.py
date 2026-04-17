@@ -24,7 +24,7 @@ class AppOrchestrator:
     Instantiate after QApplication is created but before ``app.exec()``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, debug: bool = False) -> None:
         # Resolve the directory where the executable / script lives
         if getattr(sys, "frozen", False):
             self._app_dir = os.path.dirname(sys.executable)
@@ -32,6 +32,8 @@ class AppOrchestrator:
             self._app_dir = os.path.dirname(os.path.abspath(__file__))
             # When running from the app/ package, go up one level to project root
             self._app_dir = os.path.dirname(self._app_dir)
+
+        self._debug = debug
 
         # --- Models ---
         settings_path = os.path.join(self._app_dir, "appsettings.json")
@@ -65,7 +67,12 @@ class AppOrchestrator:
             viewer=self._window.viewer,
             toolbar=self._window.toolbar,
             settings_panel=self._window.settings_panel,
+            debug=self._debug,
         )
+
+        # Reveal debug option in settings panel if debug mode is on
+        if self._debug:
+            self._window.settings_panel.enable_debug_option()
 
         # Toolbar repositioning after mode switch
         self._window.toolbar.btn_measure.clicked.connect(self._reposition_toolbar)

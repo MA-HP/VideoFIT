@@ -21,7 +21,7 @@ _GAMMA_LUT: np.ndarray = np.array(
 )
 
 
-def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
+def compute_edges(frame_bgr: np.ndarray, capture_stages: bool = False) -> "EdgeResult | tuple[EdgeResult, dict]":
     """
     Run the full sub-pixel edge pipeline on a **BGR** frame.
 
@@ -37,16 +37,28 @@ def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
     ----------
     frame_bgr : np.ndarray
         Input image in BGR colour order (as delivered by OpenCV / IC4).
+    capture_stages : bool
+        When ``True``, also return a ``dict`` of intermediate images keyed by
+        stage name (useful for the debug preprocessing window).
 
     Returns
     -------
     EdgeResult
         Mask, sub-pixel edge map, distance field, and silhouette centroid.
+    tuple[EdgeResult, dict]
+        Only when *capture_stages* is ``True``.
     """
+    stages: dict = {} if capture_stages else None
+
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if capture_stages:
+        stages["gray"] = gray.copy()
 
     # ── Step 1: Silhouette mask ───────────────────────────────────────
     blur = cv2.GaussianBlur(gray, (15, 15), 0)
+    if capture_stages:
+        stages["blur"] = blur.copy()
+
     thresh = cv2.adaptiveThreshold(
         blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -54,6 +66,8 @@ def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
     )
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k, iterations=2)
+    if capture_stages:
+        stages["thresh"] = thresh.copy()
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -62,6 +76,8 @@ def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
         cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+    if capture_stages:
+        stages["mask"] = mask.copy()
 
     # Silhouette centroid
     M = cv2.moments(mask)
@@ -72,16 +88,18 @@ def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
         h, w = gray.shape[:2]
         cx, cy = w / 2.0, h / 2.0
 
-    # ── Step 2: Pre-processing (full resolution) ─────────────────────
+    # ── Step 2: Pre-processing (full resolution) ──────────────────────
     gamma_corrected = cv2.LUT(gray, _GAMMA_LUT)
+    if capture_stages:
+        stages["gamma"] = gamma_corrected.copy()
 
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     eq = clahe.apply(gamma_corrected)
+    if capture_stages:
+        stages["clahe"] = eq.copy()
 
     # ── Step 3: Sub-pixel Canny-Devernay edge detection ───────────────
-    # sigma=1.2: fast OpenCV GaussianBlur (SIMD) replaces the slow bilateral.
-    # Full resolution preserved → sub-pixel precision ~0.5/66.83 ≈ 0.007 mm.
-    ex, ey, final_edges = devernay_edges(
+    ex, ey, edges_raw = devernay_edges(
         eq,
         sigma=1.2,
         high_thresh=20.0,
@@ -89,20 +107,33 @@ def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
         mask=mask,
         downsample=1.0,
     )
+    if capture_stages:
+        stages["edges_raw"] = edges_raw.copy()
 
     # Collect sub-pixel edge points as a (N, 2) float32 array
     valid = ex >= 0.0
     edge_points = np.column_stack([ex[valid], ey[valid]]).astype(np.float32)
 
-
     # ── Step 4: Add silhouette boundary for completeness ─────────────
+    final_edges = edges_raw.copy()
     if largest_contour is not None:
         cv2.drawContours(final_edges, [largest_contour], -1, 255, thickness=1)
+    if capture_stages:
+        stages["edges_final"] = final_edges.copy()
 
     # ── Step 5: Distance transform ────────────────────────────────────
     dist = cv2.distanceTransform(~final_edges, cv2.DIST_L2, 5)
+    if capture_stages:
+        stages["distance_field"] = dist.astype(np.float32)
+        # Visualise sub-pixel edge points on a black canvas
+        viz = np.zeros_like(gray)
+        if len(edge_points) > 0:
+            xs = np.clip(edge_points[:, 0].astype(np.int32), 0, gray.shape[1] - 1)
+            ys = np.clip(edge_points[:, 1].astype(np.int32), 0, gray.shape[0] - 1)
+            viz[ys, xs] = 255
+        stages["edge_points_viz"] = viz
 
-    return EdgeResult(
+    result = EdgeResult(
         mask=mask,
         edges=final_edges,
         distance_field=dist.astype(np.float32),
@@ -110,3 +141,6 @@ def compute_edges(frame_bgr: np.ndarray) -> EdgeResult:
         edge_points=edge_points,
     )
 
+    if capture_stages:
+        return result, stages
+    return result
