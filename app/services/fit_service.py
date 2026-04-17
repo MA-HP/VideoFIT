@@ -192,7 +192,7 @@ def fit(
 
 
 # ======================================================================
-# Complete mode — 3-step pipeline (GLOBAL+REFINE → GLOBAL+REFINE → REFINE)
+# Refine mode — 3-step pipeline (GLOBAL+REFINE → GLOBAL+REFINE → REFINE)
 # ======================================================================
 
 def _refine_from(
@@ -252,7 +252,7 @@ def fit_complete(
     distance_field: np.ndarray | None = None,
 ) -> FitResult:
     """
-    Complete mode: 3-step pipeline for higher precision on REFINE-layer entities.
+    Refine mode: 3-step pipeline for higher precision on REFINE-layer entities.
 
     Step 1 — Coarse:   angle sweep + Powell on ALL layers (GLOBAL + REFINE).
     Step 2 — Refine:   Powell from Step 1 result on ALL layers.

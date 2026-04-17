@@ -41,7 +41,7 @@ def load_dxf(
     # ── Step 1: Extract geometry per entity ───────────────────────────
     # Each DXF entity (LINE, ARC, SPLINE, CIRCLE, LWPOLYLINE…) becomes its own
     # polyline. We do NOT chain/merge adjacent segments — preserving entity
-    # boundaries is crucial for "points of interest" in Complete mode and gives
+    # boundaries is crucial for "points of interest" in Refine mode and gives
     # the optimizer many more independently-shaped features to lock onto.
     raw_polylines_mm: list[np.ndarray] = []
     raw_layers: list[str] = []   # layer name per polyline (upper-cased)

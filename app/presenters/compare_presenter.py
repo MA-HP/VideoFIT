@@ -51,7 +51,7 @@ class _FitWorker(QRunnable):
                 edge_result = compute_edges(self.frame_bgr)
                 stages = None
 
-            if self.mode == "Complete":
+            if self.mode == "Refine":
                 result = fit_complete(
                     polylines_all=self.dxf_data.polylines,
                     polylines_refine=self.dxf_data.polylines_refine,

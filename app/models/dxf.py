@@ -21,6 +21,6 @@ class Dxf:
     doc: ezdxf.document.Drawing | None = None                 # Original ezdxf document for native rendering
     px_per_mm: float = 1.0                                    # camera calibration used
     canvas_shape: tuple[int, int] = (0, 0)                    # (H, W) canvas shape used
-    # Layer-separated polylines for Complete mode
+    # Layer-separated polylines for Refine mode
     polylines_global: list[np.ndarray] = field(default_factory=list)   # GLOBAL layer
     polylines_refine: list[np.ndarray] = field(default_factory=list)   # REFINE layer
