@@ -28,8 +28,8 @@ class SettingsPanel(QFrame):
         rows = [
             ("Comparison Mode:", self.combo_comparison),
             ("Camera:", self.combo_camera),
-            ("Heatmap min error (mm):", self.input_heatmap_min),
-            ("Heatmap max error (mm):", self.input_heatmap_max),
+            ("Min error (mm):", self.input_heatmap_min),
+            ("Max error (mm):", self.input_heatmap_max),
         ]
         for row, (label_text, widget) in enumerate(rows):
             layout.addWidget(QLabel(label_text), row, 0)

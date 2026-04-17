@@ -13,6 +13,7 @@ GLASS_STYLE = """
     QLabel {
         color: rgba(255, 255, 255, 220);
         font-weight: bold;
+        background-color: transparent;
     }
     QPushButton {
         background-color: transparent;
