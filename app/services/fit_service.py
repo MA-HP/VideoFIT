@@ -318,3 +318,157 @@ def fit_complete(
         dist_t=dist_t,
     )
 
+
+# ======================================================================
+# POC mode — 4-step pipeline (Position / Orientation / Centre)
+# Layers: GLOBAL, ROT, PAN
+# Step 1: Coarse   — all layers (GLOBAL + ROT + PAN), full (tx, ty, θ)
+# Step 2: Refine   — all layers (GLOBAL + ROT + PAN), full (tx, ty, θ)
+# Step 3: Finetune — ROT + PAN layers only,           full (tx, ty, θ)
+# Step 4: Pan      — PAN layer only,                  translation only (tx, ty), θ locked
+# ======================================================================
+
+def _refine_translation_only(
+    polylines: list[np.ndarray],
+    init_params: np.ndarray,
+    dist_t: np.ndarray,
+    n_sample: int = 6000,
+    maxiter: int = 20_000,
+) -> tuple:
+    """
+    Powell refinement optimising **only tx, ty** while keeping θ locked.
+    Returns (optimized_params_3d, cost, dxf_cx, dxf_cy).
+    """
+    H, W = dist_t.shape
+    dxf_all = _sample_polylines(polylines, spacing=0.5)
+    if len(dxf_all) == 0:
+        raise ValueError("Polylines produced no sample points.")
+
+    dxf_sample = _stride_subsample(dxf_all, n=n_sample)
+    dxf_cx = float(dxf_all[:, 0].mean())
+    dxf_cy = float(dxf_all[:, 1].mean())
+    dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
+
+    _OOB_DIST = float(max(H, W))
+    _n_keep = max(1, int(len(dxf_sample) * (1.0 - _TRIM_FRAC)))
+    _all_vals = np.empty(len(dxf_c), dtype=np.float64)
+
+    theta_locked = float(init_params[2])
+    cos_t_l = np.cos(theta_locked)
+    sin_t_l = np.sin(theta_locked)
+
+    def cost_fn(params_2d):
+        tx, ty = float(params_2d[0]), float(params_2d[1])
+        nx = cos_t_l * dxf_c[:, 0] - sin_t_l * dxf_c[:, 1] + dxf_cx + tx
+        ny = sin_t_l * dxf_c[:, 0] + cos_t_l * dxf_c[:, 1] + dxf_cy + ty
+        in_b = (nx >= 0) & (nx < W - 1) & (ny >= 0) & (ny < H - 1)
+        _all_vals[:] = _OOB_DIST
+        if in_b.sum() < 10:
+            return _OOB_DIST
+        _all_vals[in_b] = map_coordinates(
+            dist_t, [ny[in_b], nx[in_b]], order=1, mode="nearest", prefilter=False
+        )
+        _all_vals.sort()
+        return float(_all_vals[:_n_keep].mean())
+
+    res = minimize(
+        cost_fn,
+        np.array([init_params[0], init_params[1]], dtype=np.float64),
+        method="Powell",
+        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": maxiter},
+    )
+    out_params = np.array([res.x[0], res.x[1], theta_locked])
+    return out_params, res.fun, dxf_cx, dxf_cy
+
+
+def _compute_inlier_frac(
+    polylines: list[np.ndarray],
+    params: np.ndarray,
+    dist_t: np.ndarray,
+) -> float:
+    """Compute inlier fraction (threshold = 2 px) for given polylines + transform."""
+    H, W = dist_t.shape
+    all_pts = _sample_polylines(polylines, spacing=1.0)
+    if len(all_pts) == 0:
+        return 0.0
+    dxf_cx = float(all_pts[:, 0].mean())
+    dxf_cy = float(all_pts[:, 1].mean())
+    all_c = (all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
+    tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
+    cos_t, sin_t = np.cos(angle), np.sin(angle)
+    nx_all = cos_t * all_c[:, 0] - sin_t * all_c[:, 1] + dxf_cx + tx
+    ny_all = sin_t * all_c[:, 0] + cos_t * all_c[:, 1] + dxf_cy + ty
+    valid = (nx_all >= 0) & (nx_all < W - 1) & (ny_all >= 0) & (ny_all < H - 1)
+    if valid.sum() > 0:
+        vals = map_coordinates(dist_t, [ny_all[valid], nx_all[valid]],
+                               order=1, mode="nearest", prefilter=False)
+        return float(np.mean(vals < 2.0))
+    return 0.0
+
+
+def fit_poc(
+    polylines_all: list[np.ndarray],
+    polylines_rot_pan: list[np.ndarray],
+    polylines_pan: list[np.ndarray],
+    edge_points: np.ndarray,
+    silhouette_mask: np.ndarray,
+    distance_field: np.ndarray | None = None,
+) -> FitResult:
+    """
+    POC mode: 4-step pipeline (Position / Orientation / Centre).
+
+    DXF layers: GLOBAL, ROT, PAN.
+
+    Step 1 — Coarse:   angle sweep + Powell on ALL layers, full (tx, ty, θ).
+    Step 2 — Refine:   Powell from Step 1 on ALL layers, full (tx, ty, θ).
+    Step 3 — Finetune: Powell from Step 2 on ROT+PAN layers, full (tx, ty, θ).
+    Step 4 — Pan:      Powell from Step 3 on PAN layer only, translation only (tx, ty), θ locked.
+    """
+    if distance_field is None:
+        raise ValueError("distance_field is required for fitting.")
+
+    # ── Step 1: Coarse fit on all layers ──────────────────────────────
+    result_coarse = fit(
+        polylines=polylines_all,
+        edge_points=edge_points,
+        silhouette_mask=silhouette_mask,
+        distance_field=distance_field,
+    )
+    dist_t = result_coarse.dist_t
+    angle_rad = np.radians(result_coarse.angle_deg)
+    params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
+
+    # ── Step 2: Refine on all layers ──────────────────────────────────
+    params_2, cost_2, cx_2, cy_2 = _refine_from(
+        polylines_all, params_1, dist_t, n_sample=6000,
+    )
+
+    # ── Step 3: Finetune on ROT + PAN layers (full tx, ty, θ) ────────
+    if polylines_rot_pan:
+        params_3, cost_3, cx_3, cy_3 = _refine_from(
+            polylines_rot_pan, params_2, dist_t, n_sample=6000,
+        )
+    else:
+        params_3, cost_3, cx_3, cy_3 = params_2, cost_2, cx_2, cy_2
+
+    # ── Step 4: Pan on PAN layer only (translation only, θ locked) ───
+    if polylines_pan:
+        params_4, cost_4, cx_4, cy_4 = _refine_translation_only(
+            polylines_pan, params_3, dist_t, n_sample=6000,
+        )
+    else:
+        params_4, cost_4, cx_4, cy_4 = params_3, cost_3, cx_3, cy_3
+
+    # ── Inlier fraction on ALL polylines ──────────────────────────────
+    inlier_frac = _compute_inlier_frac(polylines_all, params_4, dist_t)
+
+    return FitResult(
+        tx=float(params_4[0]),
+        ty=float(params_4[1]),
+        angle_deg=float(np.degrees(params_4[2])),
+        cost=float(cost_4),
+        dxf_cx=cx_4,
+        dxf_cy=cy_4,
+        inlier_frac=inlier_frac,
+        dist_t=dist_t,
+    )

@@ -24,3 +24,6 @@ class Dxf:
     # Layer-separated polylines for Refine mode
     polylines_global: list[np.ndarray] = field(default_factory=list)   # GLOBAL layer
     polylines_refine: list[np.ndarray] = field(default_factory=list)   # REFINE layer
+    # Layer-separated polylines for POC mode
+    polylines_rot: list[np.ndarray] = field(default_factory=list)      # ROT layer
+    polylines_pan: list[np.ndarray] = field(default_factory=list)      # PAN layer

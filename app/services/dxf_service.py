@@ -85,6 +85,8 @@ def load_dxf(
     polylines: list[np.ndarray] = []
     polylines_global: list[np.ndarray] = []
     polylines_refine: list[np.ndarray] = []
+    polylines_rot: list[np.ndarray] = []
+    polylines_pan: list[np.ndarray] = []
     for i, poly_mm in enumerate(raw_polylines_mm):
         x_px = canvas_cx + (poly_mm[:, 0] - dxf_cx) * px_per_mm
         y_px = canvas_cy - (poly_mm[:, 1] - dxf_cy) * px_per_mm  # Y-flip
@@ -93,6 +95,10 @@ def load_dxf(
         layer = raw_layers[i]
         if layer == "REFINE":
             polylines_refine.append(poly_px)
+        elif layer == "ROT":
+            polylines_rot.append(poly_px)
+        elif layer == "PAN":
+            polylines_pan.append(poly_px)
         else:
             polylines_global.append(poly_px)
 
@@ -104,4 +110,6 @@ def load_dxf(
         canvas_shape=canvas_shape,
         polylines_global=polylines_global,
         polylines_refine=polylines_refine,
+        polylines_rot=polylines_rot,
+        polylines_pan=polylines_pan,
     )

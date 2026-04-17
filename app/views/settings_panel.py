@@ -20,7 +20,7 @@ class SettingsPanel(QFrame):
 
         # Expose widgets for presenters to manipulate
         self.combo_comparison = QComboBox()
-        self.combo_comparison.addItems(["Best Fit", "Refine"])
+        self.combo_comparison.addItems(["Best Fit", "Refine", "POC"])
         self.combo_camera = QComboBox()
         self.input_heatmap_min = QLineEdit("0.1")
         self.input_heatmap_max = QLineEdit("0.5")

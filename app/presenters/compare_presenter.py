@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QFileDialog
 from app.models.dxf import Dxf
 from app.services.dxf_service import load_dxf
 from app.services.edge_service import compute_edges
-from app.services.fit_service import fit, fit_complete
+from app.services.fit_service import fit, fit_complete, fit_poc
 from app.models.settings import AppSettings
 from app.views.debug_window import DebugPreprocessingWindow
 from app.views.dxf_overlay import DxfOverlay
@@ -51,7 +51,16 @@ class _FitWorker(QRunnable):
                 edge_result = compute_edges(self.frame_bgr)
                 stages = None
 
-            if self.mode == "Refine":
+            if self.mode == "POC":
+                result = fit_poc(
+                    polylines_all=self.dxf_data.polylines,
+                    polylines_rot_pan=self.dxf_data.polylines_rot + self.dxf_data.polylines_pan,
+                    polylines_pan=self.dxf_data.polylines_pan,
+                    edge_points=edge_result.edge_points,
+                    silhouette_mask=edge_result.mask,
+                    distance_field=edge_result.distance_field,
+                )
+            elif self.mode == "Refine":
                 result = fit_complete(
                     polylines_all=self.dxf_data.polylines,
                     polylines_refine=self.dxf_data.polylines_refine,
