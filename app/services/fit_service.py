@@ -250,6 +250,8 @@ def fit_complete(
     edge_points: np.ndarray,
     silhouette_mask: np.ndarray,
     distance_field: np.ndarray | None = None,
+    polylines_rot: list[np.ndarray] | None = None,
+    polylines_pan: list[np.ndarray] | None = None,
 ) -> FitResult:
     """
     Refine mode: 3-step pipeline for higher precision on REFINE-layer entities.
@@ -257,9 +259,19 @@ def fit_complete(
     Step 1 — Coarse:   angle sweep + Powell on ALL layers (GLOBAL + REFINE).
     Step 2 — Refine:   Powell from Step 1 result on ALL layers.
     Step 3 — Finetune: Powell from Step 2 result on REFINE layer only.
+
+    If the REFINE layer is empty, ROT + PAN layers are used as a fallback.
     """
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
+
+    # ── Resolve effective REFINE polylines ────────────────────────────
+    # If no REFINE layer is present, fall back to ROT + PAN concatenated.
+    effective_refine = polylines_refine
+    if not effective_refine:
+        effective_refine = (polylines_rot or []) + (polylines_pan or [])
+        if effective_refine:
+            print("Refine mode: no REFINE layer found — using ROT + PAN as fallback.")
 
     # ── Step 1: Coarse fit on all layers (same as best-fit) ───────────
     result_coarse = fit(
@@ -279,13 +291,13 @@ def fit_complete(
         polylines_all, params_1, dist_t, n_sample=6000,
     )
 
-    # ── Step 3: Finetune on REFINE layer only ─────────────────────────
-    if polylines_refine:
+    # ── Step 3: Finetune on REFINE layer (or ROT+PAN fallback) ───────
+    if effective_refine:
         params_3, cost_3, dxf_cx_3, dxf_cy_3 = _refine_from(
-            polylines_refine, params_2, dist_t, n_sample=6000,
+            effective_refine, params_2, dist_t, n_sample=6000,
         )
     else:
-        # No REFINE layer — fall back to step 2 result
+        # No usable fine-tuning layer at all — keep step 2 result
         params_3, cost_3, dxf_cx_3, dxf_cy_3 = params_2, cost_2, dxf_cx_2, dxf_cy_2
 
     tx_opt, ty_opt, angle_opt = params_3

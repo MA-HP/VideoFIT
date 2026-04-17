@@ -67,6 +67,8 @@ class _FitWorker(QRunnable):
                     edge_points=edge_result.edge_points,
                     silhouette_mask=edge_result.mask,
                     distance_field=edge_result.distance_field,
+                    polylines_rot=self.dxf_data.polylines_rot,
+                    polylines_pan=self.dxf_data.polylines_pan,
                 )
             else:
                 result = fit(
