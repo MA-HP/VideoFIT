@@ -6,10 +6,10 @@ Algorithm
 ---------
 1. Sample DXF polylines densely at sub-pixel spacing (stratified, deterministic).
 2. Pre-smooth the distance field once (gaussian) to widen the basin of attraction.
-3. Coarse angle sweep (144 angles, vectorised) → keep top 5 candidates.
+3. Coarse angle sweep (180 angles, vectorised) → keep top 10 candidates.
 4. Powell refinement only — fully deterministic, no Nelder-Mead.
 5. Cost = trimmed mean of bilinear-interpolated distance field values
-   (worst 15 % dropped, soft OOB penalty).
+   (worst 10 % dropped, soft OOB penalty).
 
 Why map_coordinates instead of KDTree
 --------------------------------------
@@ -29,7 +29,7 @@ from scipy.optimize import minimize
 from app.models.fit_result import FitResult
 
 # Fraction of worst-distance points ignored in cost (robustness to spurious edges)
-_TRIM_FRAC = 0.15
+_TRIM_FRAC = 0.10
 
 
 def _make_cost_fn(
@@ -106,7 +106,8 @@ def _make_cost_fn(
                 if in_b.sum() < 10:
                     return _OOB_DIST
                 vals.sort()
-                return float(vals[:_n_keep].mean())
+                # Trimmed mean + soft penalty for the worst 10% to preserve gradient
+                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
     else:
         if objective == "Tolerance":
             def cost_fn(params):
@@ -127,7 +128,8 @@ def _make_cost_fn(
                 if in_b.sum() < 10:
                     return _OOB_DIST
                 vals.sort()
-                return float(vals[:_n_keep].mean())
+                # Trimmed mean + soft penalty for the worst 10% to preserve gradient
+                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
 
     return cost_fn
 
@@ -229,11 +231,11 @@ def fit(
     cost = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
                          objective=objective, max_error_px=max_error_px)
 
-    # ── Step 5: Vectorised coarse angle sweep (144 angles) ────────────
-    angles = np.linspace(-np.pi, np.pi, 144, endpoint=False)
+    # ── Step 5: Vectorised coarse angle sweep (180 angles) ────────────
+    angles = np.linspace(-np.pi, np.pi, 180, endpoint=False)
     sweep_costs = np.fromiter((cost([tx_init, ty_init, a]) for a in angles),
                               dtype=np.float64, count=len(angles))
-    top_idx = np.argsort(sweep_costs)[:5]
+    top_idx = np.argsort(sweep_costs)[:10]
     top_candidates = [[tx_init, ty_init, float(angles[i])] for i in top_idx]
 
     # ── Step 6: Powell refinement only — deterministic ────────────────
