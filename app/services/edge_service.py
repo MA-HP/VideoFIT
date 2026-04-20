@@ -125,13 +125,47 @@ def compute_edges(frame_bgr: np.ndarray, capture_stages: bool = False) -> "EdgeR
     dist = cv2.distanceTransform(~final_edges, cv2.DIST_L2, 5)
     if capture_stages:
         stages["distance_field"] = dist.astype(np.float32)
-        # Visualise sub-pixel edge points on a black canvas
-        viz = np.zeros_like(gray)
+
+        h_img, w_img = gray.shape[:2]
+
+        # ── ⑩ Sub-pixel edge points (rounded) ────────────────────────
+        viz = np.zeros((h_img, w_img), dtype=np.uint8)
         if len(edge_points) > 0:
-            xs = np.clip(edge_points[:, 0].astype(np.int32), 0, gray.shape[1] - 1)
-            ys = np.clip(edge_points[:, 1].astype(np.int32), 0, gray.shape[0] - 1)
+            xs = np.clip(edge_points[:, 0].astype(np.int32), 0, w_img - 1)
+            ys = np.clip(edge_points[:, 1].astype(np.int32), 0, h_img - 1)
             viz[ys, xs] = 255
         stages["edge_points_viz"] = viz
+
+        # ── ⑪ Sub-pixel offset colour map ────────────────────────────
+        # R = |frac(ex)|*2, G = |frac(ey)|*2, mapped to 0-255.
+        # Coloured pixels → real sub-pixel offsets (Devernay working).
+        # All black / uniform grey → offsets are zero (something is wrong).
+        offset_map = np.zeros((h_img, w_img, 3), dtype=np.uint8)
+        if len(edge_points) > 0:
+            frac_x = np.abs(edge_points[:, 0] - np.round(edge_points[:, 0]))
+            frac_y = np.abs(edge_points[:, 1] - np.round(edge_points[:, 1]))
+            xs_i = np.clip(edge_points[:, 0].astype(np.int32), 0, w_img - 1)
+            ys_i = np.clip(edge_points[:, 1].astype(np.int32), 0, h_img - 1)
+            offset_map[ys_i, xs_i, 0] = (frac_x * 510).clip(0, 255).astype(np.uint8)  # R = offset X
+            offset_map[ys_i, xs_i, 1] = (frac_y * 510).clip(0, 255).astype(np.uint8)  # G = offset Y
+            offset_map[ys_i, xs_i, 2] = 50  # dim blue baseline so zero-offset pixels show as dark blue
+        stages["subpixel_offset_map"] = offset_map
+
+        # ── ⑫ Anti-aliased sub-pixel overlay on CLAHE ─────────────────
+        # Uses OpenCV fixed-point SHIFT rendering so dots are drawn at
+        # the *true* fractional position — compare with edges_raw to see
+        # the sub-pixel smoothness / continuity improvement.
+        overlay = cv2.cvtColor(eq, cv2.COLOR_GRAY2BGR)
+        if len(edge_points) > 0:
+            SHIFT = 4
+            SCALE = 1 << SHIFT  # 16
+            pts_shifted = (edge_points * SCALE).astype(np.int32)
+            radius_shifted = max(1, SCALE // 4)
+            step = max(1, len(pts_shifted) // 8000)  # thin for speed
+            for pt in pts_shifted[::step]:
+                cv2.circle(overlay, (pt[0], pt[1]), radius_shifted,
+                           (0, 90, 255), -1, cv2.LINE_AA, shift=SHIFT)
+        stages["subpixel_overlay"] = overlay
 
     result = EdgeResult(
         mask=mask,

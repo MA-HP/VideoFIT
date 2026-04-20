@@ -307,7 +307,9 @@ class DebugPreprocessingWindow(QDialog):
         ("edges_raw",       "⑦ Canny-Devernay Edges"),
         ("edges_final",     "⑧ Edges + Silhouette Boundary"),
         ("distance_field",  "⑨ Distance Transform"),
-        ("edge_points_viz", "⑩ Sub-pixel Edge Points"),
+        ("edge_points_viz",      "⑩ Sub-pixel Points (rounded)"),
+        ("subpixel_offset_map",  "⑪ Sub-pixel Offset Map  R=ΔX G=ΔY"),
+        ("subpixel_overlay",     "⑫ Sub-pixel Overlay on CLAHE (anti-aliased)"),
     ]
 
     def __init__(self, parent=None) -> None:
