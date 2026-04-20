@@ -10,15 +10,17 @@ Pipeline
                        → silhouette mask (frame / parasites filtered out)
 4.  Canny (50 – 150) masked to silhouette
 5.  Silhouette contour drawn onto edge map for boundary completeness
-6.  Distance transform on the inverted edge map
+6.  Hybrid Narrow-Band Distance Transform (Sub-pixel exactly at edges)
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
+from scipy.spatial import cKDTree
 
 from app.models.edge_result import EdgeResult
+from app.services.devernay_service import devernay_edges
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +91,7 @@ def compute_edges(
         stages["gray"] = gray.copy()
 
     # ── Step 2: Bilateral filter ──────────────────────────────────────
-    bilateral = cv2.bilateralFilter(gray, d=10, sigmaColor=120, sigmaSpace=90)
+    bilateral = cv2.bilateralFilter(gray, d=9, sigmaColor=110, sigmaSpace=85)
     if capture_stages:
         stages["bilateral"] = bilateral.copy()
 
@@ -142,14 +144,54 @@ def compute_edges(
     if capture_stages:
         stages["edges_final"] = final_edges.copy()
 
-    # ── Step 6: Distance transform ────────────────────────────────────
-    dist = cv2.distanceTransform(~final_edges, cv2.DIST_L2, 5)
-    if capture_stages:
-        stages["distance_field"] = dist.astype(np.float32)
+    # ── Step 5.5: Devernay sub-pixel refinement ──────────────────────
+    dilate_k5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    devernay_mask = cv2.dilate(final_edges, dilate_k5, iterations=1)
 
-    # Edge points as (N, 2) float32 [x, y]
-    ys_ep, xs_ep = np.where(final_edges > 0)
+    ex, ey, edges_dev = devernay_edges(
+        gray=bilateral,
+        sigma=0.0,
+        high_thresh=20.0,
+        low_thresh=10.0,
+        mask=devernay_mask,
+        downsample=1.0
+    )
+    if capture_stages:
+        stages["edges_dev"] = edges_dev.copy()
+
+    # ── Step 6: Hybrid Narrow-Band Distance Transform ─────────────────
+    combined_edges = cv2.bitwise_or(final_edges, edges_dev)
+    if capture_stages:
+        stages["edges_combined"] = combined_edges.copy()
+
+    ys_ep, xs_ep = np.where(combined_edges > 0)
     edge_points = np.column_stack([xs_ep, ys_ep]).astype(np.float32)
+
+    valid_mask = ex[ys_ep, xs_ep] >= 0.0
+    edge_points[valid_mask, 0] = ex[ys_ep, xs_ep][valid_mask]
+    edge_points[valid_mask, 1] = ey[ys_ep, xs_ep][valid_mask]
+
+    h_fr, w_fr = gray.shape[:2]
+
+    # 1. Fast base pixel-level distance via OpenCV
+    bg_mask = cv2.bitwise_not(combined_edges)
+    dist = cv2.distanceTransform(bg_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+
+    # 2. Exact sub-pixel correction in narrow band via cKDTree
+    if len(edge_points) > 0:
+        BAND_RADIUS = 10.0
+        ys_b, xs_b = np.where(dist <= BAND_RADIUS)
+
+        if len(ys_b) > 0:
+            band_pts = np.column_stack([xs_b, ys_b])
+            tree = cKDTree(edge_points)
+            exact_dist, _ = tree.query(band_pts)
+            dist[ys_b, xs_b] = exact_dist.astype(np.float32)
+    else:
+        dist = np.full((h_fr, w_fr), max(h_fr, w_fr), dtype=np.float32)
+
+    if capture_stages:
+        stages["distance_field"] = dist
 
     # ── Debug extra stages ─────────────────────────────────────────────
     if capture_stages:
@@ -170,8 +212,8 @@ def compute_edges(
 
     result = EdgeResult(
         mask=mask,
-        edges=final_edges,
-        distance_field=dist.astype(np.float32),
+        edges=combined_edges,
+        distance_field=dist,
         silhouette_centroid=np.array([cx, cy]),
         edge_points=edge_points,
     )

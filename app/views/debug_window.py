@@ -304,9 +304,11 @@ class DebugPreprocessingWindow(QDialog):
         ("mask",            "④ Silhouette Mask (largest interior blob)"),
         ("edges_raw",       "⑤ Canny Edges (50–150, masked)"),
         ("edges_final",     "⑥ Edges + Silhouette Boundary"),
-        ("distance_field",  "⑦ Distance Transform"),
-        ("edge_points_viz", "⑧ Edge Points Map"),
-        ("subpixel_overlay","⑨ Edge Overlay on Bilateral"),
+        ("edges_dev",       "⑦ Devernay Sub-pixel Edges"),
+        ("edges_combined",  "⑧ Combined Edges"),
+        ("distance_field",  "⑨ Distance Transform"),
+        ("edge_points_viz", "⑩ Edge Points Map"),
+        ("subpixel_overlay","⑪ Edge Overlay on Bilateral"),
     ]
 
     def __init__(self, parent=None) -> None:
