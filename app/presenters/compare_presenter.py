@@ -54,7 +54,7 @@ class _FitWorker(QRunnable):
             if self.mode == "POC":
                 result = fit_poc(
                     polylines_all=self.dxf_data.polylines,
-                    polylines_rot_pan=self.dxf_data.polylines_rot + self.dxf_data.polylines_pan,
+                    polylines_rot=self.dxf_data.polylines_rot,
                     polylines_pan=self.dxf_data.polylines_pan,
                     edge_points=edge_result.edge_points,
                     silhouette_mask=edge_result.mask,

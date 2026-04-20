@@ -420,7 +420,7 @@ def _compute_inlier_frac(
 
 def fit_poc(
     polylines_all: list[np.ndarray],
-    polylines_rot_pan: list[np.ndarray],
+    polylines_rot: list[np.ndarray],
     polylines_pan: list[np.ndarray],
     edge_points: np.ndarray,
     silhouette_mask: np.ndarray,
@@ -433,7 +433,7 @@ def fit_poc(
 
     Step 1 — Coarse:   angle sweep + Powell on ALL layers, full (tx, ty, θ).
     Step 2 — Refine:   Powell from Step 1 on ALL layers, full (tx, ty, θ).
-    Step 3 — Finetune: Powell from Step 2 on ROT+PAN layers, full (tx, ty, θ).
+    Step 3 — Finetune: Powell from Step 2 on ROT layer only, full (tx, ty, θ).
     Step 4 — Pan:      Powell from Step 3 on PAN layer only, translation only (tx, ty), θ locked.
     """
     if distance_field is None:
@@ -455,10 +455,10 @@ def fit_poc(
         polylines_all, params_1, dist_t, n_sample=6000,
     )
 
-    # ── Step 3: Finetune on ROT + PAN layers (full tx, ty, θ) ────────
-    if polylines_rot_pan:
+    # ── Step 3: Finetune on ROT layer only (full tx, ty, θ) ──────────
+    if polylines_rot:
         params_3, cost_3, cx_3, cy_3 = _refine_from(
-            polylines_rot_pan, params_2, dist_t, n_sample=6000,
+            polylines_rot, params_2, dist_t, n_sample=6000,
         )
     else:
         params_3, cost_3, cx_3, cy_3 = params_2, cost_2, cx_2, cy_2
