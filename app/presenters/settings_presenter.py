@@ -28,6 +28,7 @@ class SettingsPresenter(QObject):
 
         # Apply defaults from the model into the view
         self._panel.combo_comparison.setCurrentText(settings.app_defaults.comparison_mode)
+        self._panel.combo_fit_objective.setCurrentText(settings.app_defaults.fit_objective)
 
         # Populate camera combo from settings (names only — presenter decides content)
         self._panel.combo_camera.clear()

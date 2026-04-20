@@ -21,12 +21,19 @@ class SettingsPanel(QFrame):
         # Expose widgets for presenters to manipulate
         self.combo_comparison = QComboBox()
         self.combo_comparison.addItems(["Best Fit", "Refine", "POC"])
+        self.combo_fit_objective = QComboBox()
+        self.combo_fit_objective.addItems(["Strict", "Tolerance"])
+        self.combo_fit_objective.setToolTip(
+            "Strict: minimise mean distance to edges.\n"
+            "Tolerance: maximise points within max error threshold."
+        )
         self.combo_camera = QComboBox()
         self.input_heatmap_min = QLineEdit("0.1")
         self.input_heatmap_max = QLineEdit("0.5")
 
         rows = [
             ("Comparison Mode:", self.combo_comparison),
+            ("Fit Objective:", self.combo_fit_objective),
             ("Camera:", self.combo_camera),
             ("Min error (mm):", self.input_heatmap_min),
             ("Max error (mm):", self.input_heatmap_max),

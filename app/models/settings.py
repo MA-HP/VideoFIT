@@ -25,6 +25,7 @@ class CameraInfo:
 class AppDefaults:
     """Application-level default values."""
     comparison_mode: str = "Best Fit"
+    fit_objective: str = "Strict"
 
 
 @dataclass
@@ -47,6 +48,7 @@ class AppSettings:
             defaults_raw = raw.get("app_defaults", {})
             app_defaults = AppDefaults(
                 comparison_mode=defaults_raw.get("comparison_mode", "Best Fit"),
+                fit_objective=defaults_raw.get("fit_objective", "Strict"),
             )
 
             cameras = [

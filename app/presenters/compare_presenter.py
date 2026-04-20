@@ -34,12 +34,15 @@ class _FitSignals(QObject):
 class _FitWorker(QRunnable):
     """Runs the heavy edge-detection + fitting pipeline off the UI thread."""
 
-    def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf, debug: bool = False, mode: str = "Best Fit") -> None:
+    def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf, debug: bool = False,
+                 mode: str = "Best Fit", objective: str = "Strict", max_error_px: float = 2.0) -> None:
         super().__init__()
         self.frame_bgr = frame_bgr
         self.dxf_data = dxf_data
         self.debug = debug
         self.mode = mode
+        self.objective = objective
+        self.max_error_px = max_error_px
         self.signals = _FitSignals()
 
     def run(self) -> None:
@@ -59,6 +62,8 @@ class _FitWorker(QRunnable):
                     edge_points=edge_result.edge_points,
                     silhouette_mask=edge_result.mask,
                     distance_field=edge_result.distance_field,
+                    objective=self.objective,
+                    max_error_px=self.max_error_px,
                 )
             elif self.mode == "Refine":
                 result = fit_complete(
@@ -69,6 +74,8 @@ class _FitWorker(QRunnable):
                     distance_field=edge_result.distance_field,
                     polylines_rot=self.dxf_data.polylines_rot,
                     polylines_pan=self.dxf_data.polylines_pan,
+                    objective=self.objective,
+                    max_error_px=self.max_error_px,
                 )
             else:
                 result = fit(
@@ -76,6 +83,8 @@ class _FitWorker(QRunnable):
                     edge_points=edge_result.edge_points,
                     silhouette_mask=edge_result.mask,
                     distance_field=edge_result.distance_field,
+                    objective=self.objective,
+                    max_error_px=self.max_error_px,
                 )
             self.signals.finished.emit((result, stages) if self.debug else result)
         except Exception as exc:
@@ -177,7 +186,11 @@ class ComparePresenter(QObject):
         debug = (self._debug_enabled
                  and self._settings_panel.chk_debug.isChecked())
         mode = self._settings_panel.combo_comparison.currentText()
-        worker = _FitWorker(frame_bgr.copy(), self._dxf_data, debug=debug, mode=mode)
+        objective = self._settings_panel.combo_fit_objective.currentText()
+        px_per_mm = self._active_calibration()
+        max_error_px = self._active_heatmap_max() * px_per_mm if px_per_mm > 0 else 2.0
+        worker = _FitWorker(frame_bgr.copy(), self._dxf_data, debug=debug, mode=mode,
+                            objective=objective, max_error_px=max_error_px)
         worker.signals.finished.connect(self._on_fit_done)
         worker.signals.error.connect(self._on_fit_error)
         worker.setAutoDelete(True)
@@ -193,9 +206,9 @@ class ComparePresenter(QObject):
         else:
             result, stages = payload, None
 
-        fit_info = (f"tx={result.tx:+.1f}  ty={result.ty:+.1f}  "
+        fit_info = (f"tx={result.tx:+.2f}  ty={result.ty:+.2f}  "
                     f"angle={result.angle_deg:.2f}°  cost={result.cost:.2f}  "
-                    f"inlier={result.inlier_frac * 100:.1f}%")
+                    f"inlier={result.inlier_frac * 100:.2f}%")
         print(f"Fit complete — {fit_info}")
 
         px_per_mm = self._dxf_data.px_per_mm
