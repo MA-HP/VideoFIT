@@ -299,17 +299,14 @@ class DebugPreprocessingWindow(QDialog):
 
     _STAGE_ORDER = [
         ("gray",            "① Grayscale"),
-        ("blur",            "② Gaussian Blur (mask prep)"),
-        ("thresh",          "③ Adaptive Threshold"),
-        ("mask",            "④ Silhouette Mask"),
-        ("gamma",           "⑤ Gamma Corrected (γ=0.8)"),
-        ("clahe",           "⑥ CLAHE"),
-        ("edges_raw",       "⑦ Canny-Devernay Edges"),
-        ("edges_final",     "⑧ Edges + Silhouette Boundary"),
-        ("distance_field",  "⑨ Distance Transform"),
-        ("edge_points_viz",      "⑩ Sub-pixel Points (rounded)"),
-        ("subpixel_offset_map",  "⑪ Sub-pixel Offset Map  R=ΔX G=ΔY"),
-        ("subpixel_overlay",     "⑫ Sub-pixel Overlay on CLAHE (anti-aliased)"),
+        ("bilateral",       "② Bilateral Filter (d=10, σc=120, σs=90)"),
+        ("thresh",          "③ Otsu Binary Threshold"),
+        ("mask",            "④ Silhouette Mask (largest interior blob)"),
+        ("edges_raw",       "⑤ Canny Edges (50–150, masked)"),
+        ("edges_final",     "⑥ Edges + Silhouette Boundary"),
+        ("distance_field",  "⑦ Distance Transform"),
+        ("edge_points_viz", "⑧ Edge Points Map"),
+        ("subpixel_overlay","⑨ Edge Overlay on Bilateral"),
     ]
 
     def __init__(self, parent=None) -> None:
