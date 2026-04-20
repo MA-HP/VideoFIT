@@ -32,9 +32,9 @@ class SettingsPanel(QFrame):
         self.input_heatmap_max = QLineEdit("0.5")
 
         rows = [
+            ("Camera:", self.combo_camera),
             ("Comparison Mode:", self.combo_comparison),
             ("Fit Objective:", self.combo_fit_objective),
-            ("Camera:", self.combo_camera),
             ("Min error (mm):", self.input_heatmap_min),
             ("Max error (mm):", self.input_heatmap_max),
         ]
