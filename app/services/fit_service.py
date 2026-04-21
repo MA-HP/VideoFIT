@@ -93,7 +93,7 @@ def _make_cost_fn(
                     return _OOB_DIST
 
                 # 1. Consider anything inside the tolerance zone as perfect (0.0 penalty) + prevent false maximum
-                vals = np.maximum(0.0, ((vals - max_error_px * 0.95) * 4.0 + vals) / 5.0)
+                vals = np.maximum(0.0, vals - max_error_px * 0.95 + vals)
 
                 # 2. Exactly the same math as Strict mode
                 vals.sort()
@@ -117,7 +117,7 @@ def _make_cost_fn(
                     return _OOB_DIST
 
                 # 1. Consider anything inside the tolerance zone as perfect (0.0 penalty) + prevent false maximum
-                vals = np.maximum(0.0, ((vals - max_error_px * 0.95) * 4.0 + vals) / 5.0)
+                vals = np.maximum(0.0, vals - max_error_px * 0.95 + vals)
 
                 # 2. Exactly the same math as Strict mode
                 vals.sort()

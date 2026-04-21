@@ -26,6 +26,9 @@ class AppDefaults:
     """Application-level default values."""
     comparison_mode: str = "Best Fit"
     fit_objective: str = "Strict"
+    heatmap_color_low: str = "#00FF00"   # color at heatmap_min (in-tolerance)
+    heatmap_color_mid: str = "#FF8000"   # color at heatmap_max boundary
+    heatmap_color_high: str = "#FF0000"  # color above heatmap_max (out-of-tolerance)
 
 
 @dataclass
@@ -49,6 +52,9 @@ class AppSettings:
             app_defaults = AppDefaults(
                 comparison_mode=defaults_raw.get("comparison_mode", "Best Fit"),
                 fit_objective=defaults_raw.get("fit_objective", "Strict"),
+                heatmap_color_low=defaults_raw.get("heatmap_color_low", "#00FF00"),
+                heatmap_color_mid=defaults_raw.get("heatmap_color_mid", "#FF8000"),
+                heatmap_color_high=defaults_raw.get("heatmap_color_high", "#FF0000"),
             )
 
             cameras = [

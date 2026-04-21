@@ -217,6 +217,9 @@ class ComparePresenter(QObject):
             result,
             heatmap_min=self._active_heatmap_min() * px_per_mm,
             heatmap_max=self._active_heatmap_max() * px_per_mm,
+            color_low=self._settings.app_defaults.heatmap_color_low,
+            color_mid=self._settings.app_defaults.heatmap_color_mid,
+            color_high=self._settings.app_defaults.heatmap_color_high,
         )
 
         # Update debug window if stages were captured

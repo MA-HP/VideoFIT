@@ -120,24 +120,32 @@ class DxfOverlay:
         result: FitResult,
         heatmap_min: float = 1.0,
         heatmap_max: float = 3.0,
+        color_low: str = "#00FF00",
+        color_mid: str = "#FF8000",
+        color_high: str = "#FF0000",
     ) -> None:
         """
         Draw DXF natively using ezdxf PyQtBackend, applying a heatmap color
         to each native item based on its distance to the nearest real edge.
-        Green = ≤ heatmap_min px,  Yellow = heatmap_max px,  Red = > heatmap_max px.
+        color_low at heatmap_min, color_mid at heatmap_max, color_high above heatmap_max.
         Uses the raw (unsmoothed) distance field for accurate distance display.
         """
         self.clear()
         dist_field = result.dist_raw if result.dist_raw is not None else result.dist_t
         self._draw_aligned_native(dxf, result, dist_t=dist_field,
-                                  heatmap_min=heatmap_min, heatmap_max=heatmap_max)
+                                  heatmap_min=heatmap_min, heatmap_max=heatmap_max,
+                                  color_low=color_low, color_mid=color_mid,
+                                  color_high=color_high)
 
     # ── Private helpers ──────────────────────────────────────────────
 
     def _draw_aligned_native(self, dxf: Dxf, result: FitResult,
                               dist_t: np.ndarray | None = None,
                               heatmap_min: float = 1.0,
-                              heatmap_max: float = 3.0) -> None:
+                              heatmap_max: float = 3.0,
+                              color_low: str = "#00FF00",
+                              color_mid: str = "#FF8000",
+                              color_high: str = "#FF0000") -> None:
         if dxf.doc is None:
             return
 
@@ -181,9 +189,12 @@ class DxfOverlay:
         if dist_t is not None:
             brush = self._create_heatmap_brush(dist_t, final_t,
                                                heatmap_min=heatmap_min,
-                                               heatmap_max=heatmap_max)
+                                               heatmap_max=heatmap_max,
+                                               color_low=color_low,
+                                               color_mid=color_mid,
+                                               color_high=color_high)
         else:
-            brush = QBrush(QColor(0, 255, 0, 255))
+            brush = QBrush(QColor(color_low))
 
         group = self._scene.createItemGroup([])
         for item in new_items:
@@ -201,22 +212,32 @@ class DxfOverlay:
 
     def _create_heatmap_brush(self, dist_t: np.ndarray, final_t: QTransform,
                                heatmap_min: float = 1.0,
-                               heatmap_max: float = 3.0) -> QBrush:
+                               heatmap_max: float = 3.0,
+                               color_low: str = "#00FF00",
+                               color_mid: str = "#FF8000",
+                               color_high: str = "#FF0000") -> QBrush:
         H, W = dist_t.shape
 
         d = dist_t.astype(np.float32)
 
         # Two-zone scheme:
-        #   In tolerance  (d ≤ heatmap_max): green → yellow  (r: 0→255, g: 255)
-        #   Out of tolerance (d > heatmap_max): hard red      (r: 255,   g: 0)
-        # This makes tolerance violations immediately obvious as solid red.
+        #   In tolerance  (d ≤ heatmap_max): color_low → color_mid gradient
+        #   Out of tolerance (d > heatmap_max): hard color_high
+        ql = QColor(color_low)
+        qm = QColor(color_mid)
+        qh = QColor(color_high)
+
         span = max(heatmap_max - heatmap_min, 1e-6)
-        t = np.clip((d - heatmap_min) / span, 0.0, 1.0)   # 0=green, 1=yellow boundary
+        t = np.clip((d - heatmap_min) / span, 0.0, 1.0).astype(np.float32)
 
         out_of_tol = d > heatmap_max
-        r = np.where(out_of_tol, np.uint8(255), (255.0 * t).astype(np.uint8))
-        g = np.where(out_of_tol, np.uint8(0),   np.full(d.shape, 255, dtype=np.uint8))
-        b = np.zeros(d.shape, dtype=np.uint8)
+        r_in = (ql.red()   + t * (qm.red()   - ql.red())).astype(np.uint8)
+        g_in = (ql.green() + t * (qm.green() - ql.green())).astype(np.uint8)
+        b_in = (ql.blue()  + t * (qm.blue()  - ql.blue())).astype(np.uint8)
+
+        r = np.where(out_of_tol, np.uint8(qh.red()),   r_in).astype(np.uint8)
+        g = np.where(out_of_tol, np.uint8(qh.green()), g_in).astype(np.uint8)
+        b = np.where(out_of_tol, np.uint8(qh.blue()),  b_in).astype(np.uint8)
         a = np.full(d.shape, 255, dtype=np.uint8)
 
         img_data = np.stack([r, g, b, a], axis=-1)
