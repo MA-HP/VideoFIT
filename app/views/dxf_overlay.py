@@ -123,11 +123,13 @@ class DxfOverlay:
     ) -> None:
         """
         Draw DXF natively using ezdxf PyQtBackend, applying a heatmap color
-        to each native item based on its average distance to the nearest real edge.
-        Green = ≤ heatmap_min px,  Red = ≥ heatmap_max px.
+        to each native item based on its distance to the nearest real edge.
+        Green = ≤ heatmap_min px,  Yellow = heatmap_max px,  Red = > heatmap_max px.
+        Uses the raw (unsmoothed) distance field for accurate distance display.
         """
         self.clear()
-        self._draw_aligned_native(dxf, result, dist_t=result.dist_t,
+        dist_field = result.dist_raw if result.dist_raw is not None else result.dist_t
+        self._draw_aligned_native(dxf, result, dist_t=dist_field,
                                   heatmap_min=heatmap_min, heatmap_max=heatmap_max)
 
     # ── Private helpers ──────────────────────────────────────────────
@@ -204,14 +206,18 @@ class DxfOverlay:
 
         d = dist_t.astype(np.float32)
 
-        # t=0 → green (≤ heatmap_min),  t=1 → red (≥ heatmap_max)
+        # Two-zone scheme:
+        #   In tolerance  (d ≤ heatmap_max): green → yellow  (r: 0→255, g: 255)
+        #   Out of tolerance (d > heatmap_max): hard red      (r: 255,   g: 0)
+        # This makes tolerance violations immediately obvious as solid red.
         span = max(heatmap_max - heatmap_min, 1e-6)
-        t = np.clip((d - heatmap_min) / span, 0.0, 1.0)
+        t = np.clip((d - heatmap_min) / span, 0.0, 1.0)   # 0=green, 1=yellow boundary
 
-        r = (255.0 * t).astype(np.uint8)
-        g = (255.0 * (1.0 - t)).astype(np.uint8)
-        b = np.zeros_like(r)
-        a = np.full_like(r, 255)
+        out_of_tol = d > heatmap_max
+        r = np.where(out_of_tol, np.uint8(255), (255.0 * t).astype(np.uint8))
+        g = np.where(out_of_tol, np.uint8(0),   np.full(d.shape, 255, dtype=np.uint8))
+        b = np.zeros(d.shape, dtype=np.uint8)
+        a = np.full(d.shape, 255, dtype=np.uint8)
 
         img_data = np.stack([r, g, b, a], axis=-1)
 
