@@ -127,7 +127,8 @@ class DxfOverlay:
         Green = ≤ heatmap_min px,  Red = ≥ heatmap_max px.
         """
         self.clear()
-        self._draw_aligned_native(dxf, result, dist_t=result.dist_t,
+        display_field = result.distance_field_raw if result.distance_field_raw is not None else result.dist_t
+        self._draw_aligned_native(dxf, result, dist_t=display_field,
                                   heatmap_min=heatmap_min, heatmap_max=heatmap_max)
 
     # ── Private helpers ──────────────────────────────────────────────

@@ -22,4 +22,5 @@ class FitResult:
     dxf_cx: float                         # DXF centroid X used for rotation pivot (pixels)
     dxf_cy: float                         # DXF centroid Y used for rotation pivot (pixels)
     inlier_frac: float                    # fraction of DXF points within 3px of edges
-    dist_t: Optional[np.ndarray] = None  # distance transform (for heatmap overlay)
+    dist_t: Optional[np.ndarray] = None              # smoothed distance field (for optimizer)
+    distance_field_raw: Optional[np.ndarray] = None  # raw distance field (for heatmap display)

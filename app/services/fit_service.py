@@ -275,6 +275,7 @@ def fit(
         dxf_cy=dxf_cy,
         inlier_frac=inlier_frac,
         dist_t=dist_t,
+        distance_field_raw=distance_field.astype(np.float32),
     )
 
 
@@ -392,6 +393,7 @@ def fit_complete(
         dxf_cy=global_cy,
         inlier_frac=inlier_frac,
         dist_t=dist_t,
+        distance_field_raw=distance_field.astype(np.float32),
     )
 
 
@@ -548,4 +550,5 @@ def fit_poc(
         dxf_cy=global_cy,
         inlier_frac=inlier_frac,
         dist_t=dist_t,
+        distance_field_raw=distance_field.astype(np.float32),
     )
