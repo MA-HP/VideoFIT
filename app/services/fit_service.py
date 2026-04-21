@@ -60,7 +60,6 @@ def _make_cost_fn(
     H, W = dist_t.shape
     _OOB_DIST = float(max(H, W))
     _n_keep = max(1, int(len(dxf_c) * (1.0 - _TRIM_FRAC)))
-    _all_vals = np.empty(len(dxf_c), dtype=np.float64)
 
     def _sample_dist(nx, ny):
         """Bilinear-interpolate dist_t at (nx, ny); OOB points get _OOB_DIST."""
@@ -92,12 +91,13 @@ def _make_cost_fn(
                 vals, in_b = _sample_dist(nx, ny)
                 if in_b.sum() < 10:
                     return _OOB_DIST
-                # Primary: hinge loss (penalise tolerance violations heavily)
-                hinge = float(np.mean(np.maximum(0.0, vals - max_error_px)))
-                # Secondary: trimmed mean (precision — still aims for best fit)
-                sorted_vals = np.sort(vals)
-                precision = float(sorted_vals[:_n_keep].mean())
-                return 10.0 * hinge + precision
+
+                # 1. Consider anything inside the tolerance zone as perfect (0.0 penalty) + prevent false maximum
+                vals = np.maximum(0.0, ((vals - max_error_px * 0.95) * 4.0 + vals) / 5.0)
+
+                # 2. Exactly the same math as Strict mode
+                vals.sort()
+                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
         else:
             def cost_fn(params):
                 tx, ty = float(params[0]), float(params[1])
@@ -106,7 +106,6 @@ def _make_cost_fn(
                 if in_b.sum() < 10:
                     return _OOB_DIST
                 vals.sort()
-                # Trimmed mean + soft penalty for the worst 10% to preserve gradient
                 return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
     else:
         if objective == "Tolerance":
@@ -116,10 +115,13 @@ def _make_cost_fn(
                 vals, in_b = _sample_dist(nx, ny)
                 if in_b.sum() < 10:
                     return _OOB_DIST
-                hinge = float(np.mean(np.maximum(0.0, vals - max_error_px)))
-                sorted_vals = np.sort(vals)
-                precision = float(sorted_vals[:_n_keep].mean())
-                return 10.0 * hinge + precision
+
+                # 1. Consider anything inside the tolerance zone as perfect (0.0 penalty) + prevent false maximum
+                vals = np.maximum(0.0, ((vals - max_error_px * 0.95) * 4.0 + vals) / 5.0)
+
+                # 2. Exactly the same math as Strict mode
+                vals.sort()
+                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
         else:
             def cost_fn(params):
                 tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
@@ -128,7 +130,6 @@ def _make_cost_fn(
                 if in_b.sum() < 10:
                     return _OOB_DIST
                 vals.sort()
-                # Trimmed mean + soft penalty for the worst 10% to preserve gradient
                 return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
 
     return cost_fn
