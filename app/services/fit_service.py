@@ -283,17 +283,19 @@ def fit(
 # ======================================================================
 
 def _refine_from(
-    polylines: list[np.ndarray],
-    init_params: np.ndarray,
-    dist_t: np.ndarray,
-    n_sample: int = 4000,
-    maxiter: int = 20_000,
-    objective: str = "Strict",
-    max_error_px: float = 2.0,
+        polylines: list[np.ndarray],
+        init_params: np.ndarray,
+        dist_t: np.ndarray,
+        n_sample: int = 4000,
+        maxiter: int = 20_000,
+        objective: str = "Strict",
+        max_error_px: float = 2.0,
+        dxf_cx: float | None = None,
+        dxf_cy: float | None = None,
 ) -> tuple:
     """
-    Run a single Powell refinement starting from *init_params* on the given
-    polylines set. Returns (optimized_params, cost, dxf_cx, dxf_cy).
+    Run a single Powell refinement starting from *init_params*.
+    Returns (optimized_params, cost, dxf_cx, dxf_cy).
     """
     H, W = dist_t.shape
     dxf_all = _sample_polylines(polylines, spacing=0.5)
@@ -301,12 +303,16 @@ def _refine_from(
         raise ValueError("Polylines produced no sample points.")
 
     dxf_sample = _stride_subsample(dxf_all, n=n_sample)
-    dxf_cx = float(dxf_all[:, 0].mean())
-    dxf_cy = float(dxf_all[:, 1].mean())
+
+    # Use provided global centroids, otherwise compute local ones
+    if dxf_cx is None or dxf_cy is None:
+        dxf_cx = float(dxf_all[:, 0].mean())
+        dxf_cy = float(dxf_all[:, 1].mean())
+
     dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
 
     cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
-                             objective=objective, max_error_px=max_error_px)
+                            objective=objective, max_error_px=max_error_px)
 
     res = minimize(
         cost_fn,
@@ -318,37 +324,26 @@ def _refine_from(
 
 
 def fit_complete(
-    polylines_all: list[np.ndarray],
-    polylines_refine: list[np.ndarray],
-    edge_points: np.ndarray,
-    silhouette_mask: np.ndarray,
-    distance_field: np.ndarray | None = None,
-    polylines_rot: list[np.ndarray] | None = None,
-    polylines_pan: list[np.ndarray] | None = None,
-    objective: str = "Strict",
-    max_error_px: float = 2.0,
+        polylines_all: list[np.ndarray],
+        polylines_refine: list[np.ndarray],
+        edge_points: np.ndarray,
+        silhouette_mask: np.ndarray,
+        distance_field: np.ndarray | None = None,
+        polylines_rot: list[np.ndarray] | None = None,
+        polylines_pan: list[np.ndarray] | None = None,
+        objective: str = "Strict",
+        max_error_px: float = 2.0,
 ) -> FitResult:
-    """
-    Refine mode: 3-step pipeline for higher precision on REFINE-layer entities.
-
-    Step 1 — Coarse:   angle sweep + Powell on ALL layers (GLOBAL + REFINE).
-    Step 2 — Refine:   Powell from Step 1 result on ALL layers.
-    Step 3 — Finetune: Powell from Step 2 result on REFINE layer only.
-
-    If the REFINE layer is empty, ROT + PAN layers are used as a fallback.
-    """
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
 
-    # ── Resolve effective REFINE polylines ────────────────────────────
-    # If no REFINE layer is present, fall back to ROT + PAN concatenated.
     effective_refine = polylines_refine
     if not effective_refine:
         effective_refine = (polylines_rot or []) + (polylines_pan or [])
         if effective_refine:
             print("Refine mode: no REFINE layer found — using ROT + PAN as fallback.")
 
-    # ── Step 1: Coarse fit on all layers (same as best-fit) ───────────
+    # ── Step 1: Coarse fit on all layers ──────────────────────────────
     result_coarse = fit(
         polylines=polylines_all,
         edge_points=edge_points,
@@ -358,40 +353,43 @@ def fit_complete(
         max_error_px=max_error_px,
     )
     dist_t = result_coarse.dist_t
-
-    # Convert step 1 result back to optimiser param space
     angle_rad = np.radians(result_coarse.angle_deg)
     params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
 
-    # ── Step 2: Refine on all layers starting from coarse result ──────
-    params_2, cost_2, dxf_cx_2, dxf_cy_2 = _refine_from(
+    # CAPTURE GLOBAL CENTROID
+    global_cx = result_coarse.dxf_cx
+    global_cy = result_coarse.dxf_cy
+
+    # ── Step 2: Refine on all layers ──────────────────────────────────
+    params_2, cost_2, _, _ = _refine_from(
         polylines_all, params_1, dist_t, n_sample=6000,
         objective=objective, max_error_px=max_error_px,
+        dxf_cx=global_cx, dxf_cy=global_cy
     )
 
-    # ── Step 3: Finetune on REFINE layer (or ROT+PAN fallback) ───────
+    # ── Step 3: Finetune on REFINE layer ─────────────────────────────
     if effective_refine:
-        params_3, cost_3, dxf_cx_3, dxf_cy_3 = _refine_from(
+        params_3, cost_3, _, _ = _refine_from(
             effective_refine, params_2, dist_t, n_sample=6000,
             objective=objective, max_error_px=max_error_px,
+            dxf_cx=global_cx, dxf_cy=global_cy
         )
     else:
-        # No usable fine-tuning layer at all — keep step 2 result
-        params_3, cost_3, dxf_cx_3, dxf_cy_3 = params_2, cost_2, dxf_cx_2, dxf_cy_2
+        params_3, cost_3 = params_2, cost_2
 
-    tx_opt, ty_opt, angle_opt = params_3
-    H, W = dist_t.shape
-
-    # ── Inlier fraction (on ALL polylines) ────────────────────────────
-    inlier_frac = _compute_inlier_frac(polylines_all, params_3, dist_t, max_error_px=max_error_px)
+    inlier_frac = _compute_inlier_frac(
+        polylines_all, params_3, dist_t,
+        dxf_cx=global_cx, dxf_cy=global_cy,
+        max_error_px=max_error_px
+    )
 
     return FitResult(
-        tx=float(tx_opt),
-        ty=float(ty_opt),
-        angle_deg=float(np.degrees(angle_opt)),
+        tx=float(params_3[0]),
+        ty=float(params_3[1]),
+        angle_deg=float(np.degrees(params_3[2])),
         cost=float(cost_3),
-        dxf_cx=dxf_cx_3,
-        dxf_cy=dxf_cy_3,
+        dxf_cx=global_cx,
+        dxf_cy=global_cy,
         inlier_frac=inlier_frac,
         dist_t=dist_t,
     )
@@ -407,13 +405,15 @@ def fit_complete(
 # ======================================================================
 
 def _refine_translation_only(
-    polylines: list[np.ndarray],
-    init_params: np.ndarray,
-    dist_t: np.ndarray,
-    n_sample: int = 6000,
-    maxiter: int = 20_000,
-    objective: str = "Strict",
-    max_error_px: float = 2.0,
+        polylines: list[np.ndarray],
+        init_params: np.ndarray,
+        dist_t: np.ndarray,
+        n_sample: int = 6000,
+        maxiter: int = 20_000,
+        objective: str = "Strict",
+        max_error_px: float = 2.0,
+        dxf_cx: float | None = None,
+        dxf_cy: float | None = None,
 ) -> tuple:
     """
     Powell refinement optimising **only tx, ty** while keeping θ locked.
@@ -425,14 +425,18 @@ def _refine_translation_only(
         raise ValueError("Polylines produced no sample points.")
 
     dxf_sample = _stride_subsample(dxf_all, n=n_sample)
-    dxf_cx = float(dxf_all[:, 0].mean())
-    dxf_cy = float(dxf_all[:, 1].mean())
+
+    # Use provided global centroids, otherwise compute local ones
+    if dxf_cx is None or dxf_cy is None:
+        dxf_cx = float(dxf_all[:, 0].mean())
+        dxf_cy = float(dxf_all[:, 1].mean())
+
     dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
 
     theta_locked = float(init_params[2])
     cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
-                             objective=objective, max_error_px=max_error_px,
-                             locked_theta=theta_locked)
+                            objective=objective, max_error_px=max_error_px,
+                            locked_theta=theta_locked)
 
     res = minimize(
         cost_fn,
@@ -445,18 +449,20 @@ def _refine_translation_only(
 
 
 def _compute_inlier_frac(
-    polylines: list[np.ndarray],
-    params: np.ndarray,
-    dist_t: np.ndarray,
-    max_error_px: float = 2.0,
+        polylines: list[np.ndarray],
+        params: np.ndarray,
+        dist_t: np.ndarray,
+        dxf_cx: float,
+        dxf_cy: float,
+        max_error_px: float = 2.0,
 ) -> float:
     """Compute inlier fraction (threshold = max_error_px) for given polylines + transform."""
     H, W = dist_t.shape
     all_pts = _sample_polylines(polylines, spacing=1.0)
     if len(all_pts) == 0:
         return 0.0
-    dxf_cx = float(all_pts[:, 0].mean())
-    dxf_cy = float(all_pts[:, 1].mean())
+
+    # Removed local centroid calculation to enforce global coordinate frame
     all_c = (all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
     tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
     cos_t, sin_t = np.cos(angle), np.sin(angle)
@@ -471,25 +477,15 @@ def _compute_inlier_frac(
 
 
 def fit_poc(
-    polylines_all: list[np.ndarray],
-    polylines_rot: list[np.ndarray],
-    polylines_pan: list[np.ndarray],
-    edge_points: np.ndarray,
-    silhouette_mask: np.ndarray,
-    distance_field: np.ndarray | None = None,
-    objective: str = "Strict",
-    max_error_px: float = 2.0,
+        polylines_all: list[np.ndarray],
+        polylines_rot: list[np.ndarray],
+        polylines_pan: list[np.ndarray],
+        edge_points: np.ndarray,
+        silhouette_mask: np.ndarray,
+        distance_field: np.ndarray | None = None,
+        objective: str = "Strict",
+        max_error_px: float = 2.0,
 ) -> FitResult:
-    """
-    POC mode: 4-step pipeline (Position / Orientation / Centre).
-
-    DXF layers: GLOBAL, ROT, PAN.
-
-    Step 1 — Coarse:   angle sweep + Powell on ALL layers, full (tx, ty, θ).
-    Step 2 — Refine:   Powell from Step 1 on ALL layers, full (tx, ty, θ).
-    Step 3 — Finetune: Powell from Step 2 on ROT layer only, full (tx, ty, θ).
-    Step 4 — Pan:      Powell from Step 3 on PAN layer only, translation only (tx, ty), θ locked.
-    """
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
 
@@ -506,40 +502,50 @@ def fit_poc(
     angle_rad = np.radians(result_coarse.angle_deg)
     params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
 
+    # CAPTURE GLOBAL CENTROID
+    global_cx = result_coarse.dxf_cx
+    global_cy = result_coarse.dxf_cy
+
     # ── Step 2: Refine on all layers ──────────────────────────────────
-    params_2, cost_2, cx_2, cy_2 = _refine_from(
+    params_2, cost_2, _, _ = _refine_from(
         polylines_all, params_1, dist_t, n_sample=6000,
         objective=objective, max_error_px=max_error_px,
+        dxf_cx=global_cx, dxf_cy=global_cy
     )
 
-    # ── Step 3: Finetune on ROT layer only (full tx, ty, θ) ──────────
+    # ── Step 3: Finetune on ROT layer only ───────────────────────────
     if polylines_rot:
-        params_3, cost_3, cx_3, cy_3 = _refine_from(
+        params_3, cost_3, _, _ = _refine_from(
             polylines_rot, params_2, dist_t, n_sample=6000,
             objective=objective, max_error_px=max_error_px,
+            dxf_cx=global_cx, dxf_cy=global_cy
         )
     else:
-        params_3, cost_3, cx_3, cy_3 = params_2, cost_2, cx_2, cy_2
+        params_3, cost_3 = params_2, cost_2
 
-    # ── Step 4: Pan on PAN layer only (translation only, θ locked) ───
+    # ── Step 4: Pan on PAN layer only ────────────────────────────────
     if polylines_pan:
-        params_4, cost_4, cx_4, cy_4 = _refine_translation_only(
+        params_4, cost_4, _, _ = _refine_translation_only(
             polylines_pan, params_3, dist_t, n_sample=6000,
             objective=objective, max_error_px=max_error_px,
+            dxf_cx=global_cx, dxf_cy=global_cy
         )
     else:
-        params_4, cost_4, cx_4, cy_4 = params_3, cost_3, cx_3, cy_3
+        params_4, cost_4 = params_3, cost_3
 
-    # ── Inlier fraction on ALL polylines ──────────────────────────────
-    inlier_frac = _compute_inlier_frac(polylines_all, params_4, dist_t, max_error_px=max_error_px)
+    inlier_frac = _compute_inlier_frac(
+        polylines_all, params_4, dist_t,
+        dxf_cx=global_cx, dxf_cy=global_cy,
+        max_error_px=max_error_px
+    )
 
     return FitResult(
         tx=float(params_4[0]),
         ty=float(params_4[1]),
         angle_deg=float(np.degrees(params_4[2])),
         cost=float(cost_4),
-        dxf_cx=cx_4,
-        dxf_cy=cy_4,
+        dxf_cx=global_cx,
+        dxf_cy=global_cy,
         inlier_frac=inlier_frac,
         dist_t=dist_t,
     )
