@@ -49,11 +49,14 @@ def _make_cost_fn(
     dxf_c         : (N, 2) centred DXF sample points.
     dxf_cx/cy     : DXF centroid used to un-centre.
     dist_t        : Smoothed distance field (H, W).
-    objective     : "Strict"    → trimmed mean of distances (minimise).
-                    "Tolerance" → composite cost: primary hinge loss (tolerance violations
-                                  weighted 10×) + secondary trimmed mean (precision within
-                                  tolerance). Still aims for the best fit, but strongly
-                                  prefers placements where all points are within max_error_px.
+    objective     : "Strict"    → Trimmed mean of distances (minimise). Drops the worst 10%
+                                  of points to ignore spurious edges or background noise.
+                    "Tolerance" → Quadratic bowl composite cost. Distances within max_error_px
+                                  are squared (dist/max_error)^2, creating a flat-bottomed bowl
+                                  that allows inliers to shift freely without penalty. Distances
+                                  outside the threshold face a massive 999x linear wall.
+                                  Outliers are NOT down-weighted, forcing the optimizer to shift
+                                  the main body to rescue stragglers.
     max_error_px  : Tolerance threshold in pixels (Tolerance mode only).
     locked_theta  : If not None, θ is fixed and params are (tx, ty) only.
     """
@@ -92,10 +95,19 @@ def _make_cost_fn(
                 if in_b.sum() < 10:
                     return _OOB_DIST
 
-                vals = vals * 0.001 + 0.999 * np.maximum(0.0, vals - max_error_px)
+                # --- THE QUADRATIC BOWL ---
+                # Inside: gentle curve so inliers don't act as a heavy anchor
+                # Outside: massive 999x linear wall
+                vals = np.where(
+                    vals <= max_error_px,
+                    (vals / max_error_px) ** 2,
+                    1.0 + 999.0 * (vals - max_error_px)
+                )
 
                 vals.sort()
-                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
+
+                # Keep the outlier weight at 1.0 to ensure stragglers are rescued
+                return float(vals[:_n_keep].mean() + 1.0 * vals[_n_keep:].mean())
         else:
             def cost_fn(params):
                 tx, ty = float(params[0]), float(params[1])
@@ -114,10 +126,19 @@ def _make_cost_fn(
                 if in_b.sum() < 10:
                     return _OOB_DIST
 
-                vals = vals * 0.001 + 0.999 * np.maximum(0.0, vals - max_error_px)
+                # --- THE QUADRATIC BOWL ---
+                # Inside: gentle curve so inliers don't act as a heavy anchor
+                # Outside: massive 999x linear wall
+                vals = np.where(
+                    vals <= max_error_px,
+                    (vals / max_error_px) ** 2,
+                    1.0 + 999.0 * (vals - max_error_px)
+                )
 
                 vals.sort()
-                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
+
+                # Keep the outlier weight at 1.0 to ensure stragglers are rescued
+                return float(vals[:_n_keep].mean() + 1.0 * vals[_n_keep:].mean())
         else:
             def cost_fn(params):
                 tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
@@ -242,7 +263,7 @@ def fit(
             cost,
             np.array(candidate, dtype=np.float64),
             method="Powell",
-            options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": 20_000},
+            options={"xtol": 1e-6, "ftol": 1e-8, "maxiter": 20_000},
         )
         if best_res is None or res.fun < best_res.fun:
             best_res = res
