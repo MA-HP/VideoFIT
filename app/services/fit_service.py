@@ -86,16 +86,14 @@ def _make_cost_fn(
 
         if objective == "Tolerance":
             def cost_fn(params):
-                tx, ty = float(params[0]), float(params[1])
-                nx, ny = nx_base + tx, ny_base + ty
+                tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
+                nx, ny = _transform(tx, ty, theta)
                 vals, in_b = _sample_dist(nx, ny)
                 if in_b.sum() < 10:
                     return _OOB_DIST
 
-                # 1. Consider anything inside the tolerance zone as perfect (0.0 penalty) + prevent false maximum
-                vals = np.maximum(0.0, vals - max_error_px * 0.95 + vals)
+                vals = vals * 0.001 + 0.999 * np.maximum(0.0, vals - max_error_px)
 
-                # 2. Exactly the same math as Strict mode
                 vals.sort()
                 return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
         else:
@@ -116,10 +114,8 @@ def _make_cost_fn(
                 if in_b.sum() < 10:
                     return _OOB_DIST
 
-                # 1. Consider anything inside the tolerance zone as perfect (0.0 penalty) + prevent false maximum
-                vals = np.maximum(0.0, vals - max_error_px * 0.95 + vals)
+                vals = vals * 0.001 + 0.999 * np.maximum(0.0, vals - max_error_px)
 
-                # 2. Exactly the same math as Strict mode
                 vals.sort()
                 return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
         else:
