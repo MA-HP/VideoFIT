@@ -36,6 +36,35 @@ GLASS_STYLE = """
         border: 1px solid rgba(255, 255, 255, 60);
         color: white;
     }
+    QToolButton {
+        background-color: transparent;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        padding: 8px 12px;
+        color: rgba(255, 255, 255, 220);
+        font-size: 13px;
+        font-weight: bold;
+    }
+    QToolButton:hover {
+        background-color: rgba(255, 255, 255, 15);
+        border: 1px solid rgba(255, 255, 255, 30);
+    }
+    QToolButton:pressed {
+        background-color: rgba(255, 255, 255, 5);
+    }
+    QToolButton:checked {
+        background-color: rgba(255, 255, 255, 20);
+        border: 1px solid rgba(255, 255, 255, 60);
+        color: white;
+    }
+    QToolButton::menu-button {
+        border: none;
+        border-left: 1px solid rgba(255, 255, 255, 20);
+        border-top-right-radius: 6px;
+        border-bottom-right-radius: 6px;
+        width: 14px;
+    }
+    QToolButton::menu-arrow { image: none; }
     QLineEdit, QComboBox {
         background-color: rgba(0, 0, 0, 210);
         border: 1px solid rgba(255, 255, 255, 20);

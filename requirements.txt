@@ -4,4 +4,4 @@ numpy
 opencv-python
 ezdxf
 scipy
-
+pillow

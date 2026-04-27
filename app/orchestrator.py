@@ -13,6 +13,7 @@ from app.models.settings import AppSettings
 from app.services.camera_service import CameraService
 from app.presenters.camera_presenter import CameraPresenter
 from app.presenters.compare_presenter import ComparePresenter
+from app.presenters.measure_presenter import MeasurePresenter
 from app.presenters.settings_presenter import SettingsPresenter
 from app.views.main_window import MetrologyWindow
 
@@ -70,6 +71,12 @@ class AppOrchestrator:
             debug=self._debug,
         )
 
+        self._measure_presenter = MeasurePresenter(
+            settings=self._settings,
+            viewer=self._window.viewer,
+            toolbar=self._window.toolbar,
+        )
+
         # Reveal debug option in settings panel if debug mode is on
         if self._debug:
             self._window.settings_panel.enable_debug_option()
@@ -78,9 +85,13 @@ class AppOrchestrator:
         self._window.toolbar.btn_measure.clicked.connect(self._reposition_toolbar)
         self._window.toolbar.btn_compare.clicked.connect(self._reposition_toolbar)
 
-        # Clear DXF overlay when switching back to Measure mode
+        # Clear DXF overlay when switching to Measure mode
         self._window.toolbar.btn_measure.clicked.connect(
             self._compare_presenter.clear_overlay
+        )
+        # Clear measure overlay when switching to Compare mode
+        self._window.toolbar.btn_compare.clicked.connect(
+            self._measure_presenter.clear_overlay
         )
 
         # Clean shutdown

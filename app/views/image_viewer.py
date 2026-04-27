@@ -1,17 +1,28 @@
 """
 VideoFIT — Image Viewer
-QGraphicsView with pan & zoom for live camera frames.
+QGraphicsView with pan & zoom for live camera frames, and optional
+rubber-band ROI selection for the Measure mode Build tool.
 """
 
 import numpy as np
 
-from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
+from PySide6.QtCore import Qt, QPointF, QRectF, Signal, Slot
+from PySide6.QtGui import QColor, QImage, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView,
+)
 
 
 class ImageViewer(QGraphicsView):
-    """Zoomable, pannable viewer that displays OpenCV BGR→RGB frames."""
+    """Zoomable, pannable viewer that displays OpenCV BGR→RGB frames.
+
+    When ROI mode is active (set_roi_mode(True)), the user can click-drag
+    to draw a selection rectangle.  On release, roi_selected is emitted
+    with the rectangle corners in scene (pixel) coordinates, and ROI mode
+    is automatically disabled.
+    """
+
+    roi_selected = Signal(float, float, float, float)  # x1, y1, x2, y2
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -31,6 +42,11 @@ class ImageViewer(QGraphicsView):
         self.setStyleSheet("background: transparent; border: none;")
 
         self._current_cv_img: np.ndarray | None = None
+
+        # ROI selection state
+        self._roi_mode: bool = False
+        self._roi_start: QPointF | None = None
+        self._roi_rect_item: QGraphicsRectItem | None = None
 
     # ------------------------------------------------------------------
     # Public
@@ -52,6 +68,17 @@ class ImageViewer(QGraphicsView):
         self._pixmap_item.setPixmap(QPixmap.fromImage(qimg))
         self._scene.setSceneRect(self._pixmap_item.boundingRect())
 
+    def set_roi_mode(self, enabled: bool) -> None:
+        """Enable or disable rubber-band ROI selection."""
+        self._roi_mode = enabled
+        if enabled:
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+            self.setCursor(Qt.ArrowCursor)
+            self._clear_roi_rect()
+
     # ------------------------------------------------------------------
     # Overrides
     # ------------------------------------------------------------------
@@ -62,3 +89,45 @@ class ImageViewer(QGraphicsView):
         factor = zoom_in_factor if event.angleDelta().y() > 0 else zoom_out_factor
         self.scale(factor, factor)
 
+    def mousePressEvent(self, event) -> None:
+        if self._roi_mode and event.button() == Qt.LeftButton:
+            self._roi_start = self.mapToScene(event.pos())
+            self._clear_roi_rect()
+            pen = QPen(QColor(0, 200, 255), 1)
+            pen.setCosmetic(True)
+            self._roi_rect_item = self._scene.addRect(
+                QRectF(self._roi_start, self._roi_start), pen
+            )
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._roi_mode and self._roi_start is not None:
+            current = self.mapToScene(event.pos())
+            rect = QRectF(self._roi_start, current).normalized()
+            if self._roi_rect_item is not None:
+                self._roi_rect_item.setRect(rect)
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._roi_mode and event.button() == Qt.LeftButton and self._roi_start is not None:
+            end = self.mapToScene(event.pos())
+            rect = QRectF(self._roi_start, end).normalized()
+            self._roi_start = None
+            self.set_roi_mode(False)    # clears rect and resets cursor
+            if rect.width() > 2 and rect.height() > 2:
+                self.roi_selected.emit(
+                    rect.x(), rect.y(), rect.right(), rect.bottom()
+                )
+        else:
+            super().mouseReleaseEvent(event)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _clear_roi_rect(self) -> None:
+        if self._roi_rect_item is not None:
+            self._scene.removeItem(self._roi_rect_item)
+            self._roi_rect_item = None
