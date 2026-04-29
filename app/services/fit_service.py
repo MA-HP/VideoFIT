@@ -28,44 +28,23 @@ from scipy.optimize import minimize
 
 from app.models.fit_result import FitResult
 
-# Fraction of worst-distance points ignored in cost (robustness to spurious edges)
 _TRIM_FRAC = 0.10
 
 
 def _make_cost_fn(
-    dxf_c: np.ndarray,
-    dxf_cx: float,
-    dxf_cy: float,
-    dist_t: np.ndarray,
-    objective: str = "Strict",
-    max_error_px: float = 2.0,
-    locked_theta: float | None = None,
+        dxf_c: np.ndarray,
+        dxf_cx: float,
+        dxf_cy: float,
+        dist_t: np.ndarray,
+        objective: str = "Strict",
+        max_error_px: float = 2.0,
+        locked_theta: float | None = None,
 ) -> callable:
-    """
-    Build and return a cost function for the optimizer.
-
-    Parameters
-    ----------
-    dxf_c         : (N, 2) centred DXF sample points.
-    dxf_cx/cy     : DXF centroid used to un-centre.
-    dist_t        : Smoothed distance field (H, W).
-    objective     : "Strict"    → Trimmed mean of distances (minimise). Drops the worst 10%
-                                  of points to ignore spurious edges or background noise.
-                    "Tolerance" → Quadratic bowl composite cost. Distances within max_error_px
-                                  are squared (dist/max_error)^2, creating a flat-bottomed bowl
-                                  that allows inliers to shift freely without penalty. Distances
-                                  outside the threshold face a massive 999x linear wall.
-                                  Outliers are NOT down-weighted, forcing the optimizer to shift
-                                  the main body to rescue stragglers.
-    max_error_px  : Tolerance threshold in pixels (Tolerance mode only).
-    locked_theta  : If not None, θ is fixed and params are (tx, ty) only.
-    """
     H, W = dist_t.shape
     _OOB_DIST = float(max(H, W))
     _n_keep = max(1, int(len(dxf_c) * (1.0 - _TRIM_FRAC)))
 
     def _sample_dist(nx, ny):
-        """Bilinear-interpolate dist_t at (nx, ny); OOB points get _OOB_DIST."""
         in_b = (nx >= 0) & (nx < W - 1) & (ny >= 0) & (ny < H - 1)
         out = np.full(len(nx), _OOB_DIST, dtype=np.float64)
         if in_b.sum() >= 10:
@@ -80,6 +59,20 @@ def _make_cost_fn(
         ny = sin_t * dxf_c[:, 0] + cos_t * dxf_c[:, 1] + dxf_cy + ty
         return nx, ny
 
+    def _calc_partitioned_cost(vals, is_tolerance=False):
+        if is_tolerance:
+            vals = np.where(
+                vals <= max_error_px,
+                (vals / max_error_px) ** 2,
+                1.0 + 999.0 * (vals - max_error_px)
+            )
+
+        k_idx = min(_n_keep, len(vals) - 1)
+        vals = np.partition(vals, k_idx)
+
+        outlier_weight = 1.0 if is_tolerance else 0.1
+        return float(vals[:_n_keep].mean() + outlier_weight * vals[_n_keep:].mean())
+
     if locked_theta is not None:
         theta_fixed = float(locked_theta)
         cos_l = np.cos(theta_fixed)
@@ -87,77 +80,27 @@ def _make_cost_fn(
         nx_base = cos_l * dxf_c[:, 0] - sin_l * dxf_c[:, 1] + dxf_cx
         ny_base = sin_l * dxf_c[:, 0] + cos_l * dxf_c[:, 1] + dxf_cy
 
-        if objective == "Tolerance":
-            def cost_fn(params):
-                tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
-                nx, ny = _transform(tx, ty, theta)
-                vals, in_b = _sample_dist(nx, ny)
-                if in_b.sum() < 10:
-                    return _OOB_DIST
+        def cost_fn(params):
+            tx, ty = float(params[0]), float(params[1])
+            nx, ny = nx_base + tx, ny_base + ty
+            vals, in_b = _sample_dist(nx, ny)
+            if in_b.sum() < 10:
+                return _OOB_DIST
+            return _calc_partitioned_cost(vals, is_tolerance=(objective == "Tolerance"))
 
-                # --- THE QUADRATIC BOWL ---
-                # Inside: gentle curve so inliers don't act as a heavy anchor
-                # Outside: massive 999x linear wall
-                vals = np.where(
-                    vals <= max_error_px,
-                    (vals / max_error_px) ** 2,
-                    1.0 + 999.0 * (vals - max_error_px)
-                )
-
-                vals.sort()
-
-                # Keep the outlier weight at 1.0 to ensure stragglers are rescued
-                return float(vals[:_n_keep].mean() + 1.0 * vals[_n_keep:].mean())
-        else:
-            def cost_fn(params):
-                tx, ty = float(params[0]), float(params[1])
-                nx, ny = nx_base + tx, ny_base + ty
-                vals, in_b = _sample_dist(nx, ny)
-                if in_b.sum() < 10:
-                    return _OOB_DIST
-                vals.sort()
-                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
     else:
-        if objective == "Tolerance":
-            def cost_fn(params):
-                tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
-                nx, ny = _transform(tx, ty, theta)
-                vals, in_b = _sample_dist(nx, ny)
-                if in_b.sum() < 10:
-                    return _OOB_DIST
-
-                # --- THE QUADRATIC BOWL ---
-                # Inside: gentle curve so inliers don't act as a heavy anchor
-                # Outside: massive 999x linear wall
-                vals = np.where(
-                    vals <= max_error_px,
-                    (vals / max_error_px) ** 2,
-                    1.0 + 999.0 * (vals - max_error_px)
-                )
-
-                vals.sort()
-
-                # Keep the outlier weight at 1.0 to ensure stragglers are rescued
-                return float(vals[:_n_keep].mean() + 1.0 * vals[_n_keep:].mean())
-        else:
-            def cost_fn(params):
-                tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
-                nx, ny = _transform(tx, ty, theta)
-                vals, in_b = _sample_dist(nx, ny)
-                if in_b.sum() < 10:
-                    return _OOB_DIST
-                vals.sort()
-                return float(vals[:_n_keep].mean() + 0.1 * vals[_n_keep:].mean())
+        def cost_fn(params):
+            tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
+            nx, ny = _transform(tx, ty, theta)
+            vals, in_b = _sample_dist(nx, ny)
+            if in_b.sum() < 10:
+                return _OOB_DIST
+            return _calc_partitioned_cost(vals, is_tolerance=(objective == "Tolerance"))
 
     return cost_fn
 
 
 def _sample_polylines(polylines: list[np.ndarray], spacing: float = 0.5) -> np.ndarray:
-    """
-    Densely and deterministically sample points along DXF polylines.
-    Points are placed every *spacing* pixels along each segment — no randomness.
-    Returns (N, 2) float32 array of (x, y) positions.
-    """
     pts = []
     for poly in polylines:
         if len(poly) < 2:
@@ -175,10 +118,6 @@ def _sample_polylines(polylines: list[np.ndarray], spacing: float = 0.5) -> np.n
 
 
 def _stride_subsample(pts: np.ndarray, n: int) -> np.ndarray:
-    """
-    Return exactly *n* evenly-strided points from *pts*.
-    Fully deterministic — no RNG, same result every call.
-    """
     if len(pts) <= n:
         return pts
     idx = np.linspace(0, len(pts) - 1, n, dtype=np.int32)
@@ -186,33 +125,19 @@ def _stride_subsample(pts: np.ndarray, n: int) -> np.ndarray:
 
 
 def fit(
-    polylines: list[np.ndarray],
-    edge_points: np.ndarray,
-    silhouette_mask: np.ndarray,
-    distance_field: np.ndarray | None = None,
-    objective: str = "Strict",
-    max_error_px: float = 2.0,
+        polylines: list[np.ndarray],
+        edge_points: np.ndarray,
+        silhouette_mask: np.ndarray,
+        distance_field: np.ndarray | None = None,
+        objective: str = "Strict",
+        max_error_px: float = 2.0,
 ) -> FitResult:
-    """
-    Align pixel-space DXF polylines onto the sub-pixel distance field.
-
-    Parameters
-    ----------
-    polylines       : list of Nx2 float32 arrays (DXF geometry in pixel coords).
-    edge_points     : (N, 2) float32 — kept for signature compat, not used here.
-    silhouette_mask : uint8 binary mask for centroid estimation.
-    distance_field  : float32 (H, W) built from Devernay edges (required).
-    objective       : "Strict" (minimise trimmed mean distance) or
-                      "Tolerance" (maximise inlier fraction within max_error_px).
-    max_error_px    : Inlier threshold in pixels (Tolerance mode only).
-    """
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
 
     H, W = distance_field.shape
 
-    # ── Step 1: Pre-smooth distance field once ────────────────────────
-    # Widens the basin of attraction; done here, not inside the cost loop.
+    # ── Step 1: Pre-smooth ────────────────────────────────────────────
     dist_t = gaussian_filter(distance_field.astype(np.float32), sigma=1.5)
 
     # ── Step 2: Dense deterministic DXF sample ────────────────────────
@@ -220,12 +145,10 @@ def fit(
     if len(dxf_all) == 0:
         raise ValueError("DXF polylines produced no sample points.")
 
-    # Stride subsample — identical indices every call (no RNG)
+    # HARDCODED strictly to 4000 across the entire file for repeatability
     dxf_sample = _stride_subsample(dxf_all, n=4000)
 
     # ── Step 3: Centroids ─────────────────────────────────────────────
-    # Use the mean of all sampled DXF points as centroid (robust for open
-    # entities like individual arcs/lines which don't form closed polygons).
     dxf_cx = float(dxf_all[:, 0].mean())
     dxf_cy = float(dxf_all[:, 1].mean())
 
@@ -237,58 +160,54 @@ def fit(
     ty_init = scene_cy - dxf_cy
 
     # ── Step 4: Cost function ─────────────────────────────────────────
-    # Pre-centre once — avoids repeated subtraction inside the optimizer loop
     dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
-
-    _OOB_DIST = float(max(H, W))   # soft penalty for out-of-bounds points
-    _n_keep   = max(1, int(len(dxf_sample) * (1.0 - _TRIM_FRAC)))
-
-    # Pre-allocate output arrays reused across every cost call
-    _all_vals = np.empty(len(dxf_c), dtype=np.float64)
 
     cost = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
                          objective=objective, max_error_px=max_error_px)
 
-    # ── Step 5: Vectorised coarse angle sweep (180 angles) ────────────
-    angles = np.linspace(-np.pi, np.pi, 180, endpoint=False)
+    # ── Step 5: Vectorised coarse angle sweep ─────────────────────────
+    angles = np.linspace(-np.pi, np.pi, 90, endpoint=False)
     sweep_costs = np.fromiter((cost([tx_init, ty_init, a]) for a in angles),
                               dtype=np.float64, count=len(angles))
-    top_idx = np.argsort(sweep_costs)[:10]
+
+    top_idx = np.argpartition(sweep_costs, 3)[:3]
     top_candidates = [[tx_init, ty_init, float(angles[i])] for i in top_idx]
 
-    # ── Step 6: Powell refinement only — deterministic ────────────────
+    # ── Step 6: Coarse-to-Fine Powell refinement ──────────────────────
     best_res = None
+
+    # 6a. Loose search on top 3 to quickly fall into the right basin
     for candidate in top_candidates:
         res = minimize(
             cost,
             np.array(candidate, dtype=np.float64),
             method="Powell",
-            options={"xtol": 1e-6, "ftol": 1e-8, "maxiter": 20_000},
+            options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 50},
         )
         if best_res is None or res.fun < best_res.fun:
             best_res = res
 
-    tx_opt, ty_opt, angle_opt = best_res.x
+    # 6b. Strict search on the absolute winner to prevent "wiggling"
+    # Tightened ftol to 1e-5 to guarantee it hits the exact dead-center floor
+    final_res = minimize(
+        cost,
+        best_res.x,
+        method="Powell",
+        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": 300},
+    )
 
-    # ── Step 7: Inlier fraction (threshold = max_error_px) ───────────
-    all_pts = _sample_polylines(polylines, spacing=1.0)
-    all_c   = (all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
-    cos_t, sin_t = np.cos(angle_opt), np.sin(angle_opt)
-    nx_all = cos_t * all_c[:, 0] - sin_t * all_c[:, 1] + dxf_cx + tx_opt
-    ny_all = sin_t * all_c[:, 0] + cos_t * all_c[:, 1] + dxf_cy + ty_opt
-    valid_all = (nx_all >= 0) & (nx_all < W - 1) & (ny_all >= 0) & (ny_all < H - 1)
-    if valid_all.sum() > 0:
-        vals = map_coordinates(dist_t, [ny_all[valid_all], nx_all[valid_all]],
-                               order=1, mode="nearest", prefilter=False)
-        inlier_frac = float(np.mean(vals < max_error_px))
-    else:
-        inlier_frac = 0.0
+    tx_opt, ty_opt, angle_opt = final_res.x
+
+    # ── Step 7: Inlier fraction ───────────────────────────────────────
+    inlier_frac = _compute_inlier_frac(
+        polylines, final_res.x, dist_t, dxf_cx, dxf_cy, max_error_px
+    )
 
     return FitResult(
         tx=float(tx_opt),
         ty=float(ty_opt),
         angle_deg=float(np.degrees(angle_opt)),
-        cost=float(best_res.fun),
+        cost=float(final_res.fun),
         dxf_cx=dxf_cx,
         dxf_cy=dxf_cy,
         inlier_frac=inlier_frac,
@@ -298,24 +217,20 @@ def fit(
 
 
 # ======================================================================
-# Refine mode — 3-step pipeline (GLOBAL+REFINE → GLOBAL+REFINE → REFINE)
+# Refine / Sub-functions
 # ======================================================================
 
 def _refine_from(
         polylines: list[np.ndarray],
         init_params: np.ndarray,
         dist_t: np.ndarray,
-        n_sample: int = 4000,
-        maxiter: int = 20_000,
+        n_sample: int = 4000,  # Locked universally to 4000
+        maxiter: int = 300,
         objective: str = "Strict",
         max_error_px: float = 2.0,
         dxf_cx: float | None = None,
         dxf_cy: float | None = None,
 ) -> tuple:
-    """
-    Run a single Powell refinement starting from *init_params*.
-    Returns (optimized_params, cost, dxf_cx, dxf_cy).
-    """
     H, W = dist_t.shape
     dxf_all = _sample_polylines(polylines, spacing=0.5)
     if len(dxf_all) == 0:
@@ -323,7 +238,6 @@ def _refine_from(
 
     dxf_sample = _stride_subsample(dxf_all, n=n_sample)
 
-    # Use provided global centroids, otherwise compute local ones
     if dxf_cx is None or dxf_cy is None:
         dxf_cx = float(dxf_all[:, 0].mean())
         dxf_cy = float(dxf_all[:, 1].mean())
@@ -333,6 +247,7 @@ def _refine_from(
     cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
                             objective=objective, max_error_px=max_error_px)
 
+    # Tightened to 1e-5 to guarantee repeatability between passes
     res = minimize(
         cost_fn,
         init_params.astype(np.float64),
@@ -340,6 +255,71 @@ def _refine_from(
         options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": maxiter},
     )
     return res.x, res.fun, dxf_cx, dxf_cy
+
+
+def _refine_translation_only(
+        polylines: list[np.ndarray],
+        init_params: np.ndarray,
+        dist_t: np.ndarray,
+        n_sample: int = 4000,  # Locked universally to 4000
+        maxiter: int = 300,
+        objective: str = "Strict",
+        max_error_px: float = 2.0,
+        dxf_cx: float | None = None,
+        dxf_cy: float | None = None,
+) -> tuple:
+    H, W = dist_t.shape
+    dxf_all = _sample_polylines(polylines, spacing=0.5)
+    if len(dxf_all) == 0:
+        raise ValueError("Polylines produced no sample points.")
+
+    dxf_sample = _stride_subsample(dxf_all, n=n_sample)
+
+    if dxf_cx is None or dxf_cy is None:
+        dxf_cx = float(dxf_all[:, 0].mean())
+        dxf_cy = float(dxf_all[:, 1].mean())
+
+    dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
+    theta_locked = float(init_params[2])
+    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
+                            objective=objective, max_error_px=max_error_px,
+                            locked_theta=theta_locked)
+
+    res = minimize(
+        cost_fn,
+        np.array([init_params[0], init_params[1]], dtype=np.float64),
+        method="Powell",
+        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": maxiter},
+    )
+    out_params = np.array([res.x[0], res.x[1], theta_locked])
+    return out_params, res.fun, dxf_cx, dxf_cy
+
+
+def _compute_inlier_frac(
+        polylines: list[np.ndarray],
+        params: np.ndarray,
+        dist_t: np.ndarray,
+        dxf_cx: float,
+        dxf_cy: float,
+        max_error_px: float = 2.0,
+) -> float:
+    H, W = dist_t.shape
+    all_pts = _sample_polylines(polylines, spacing=1.0)
+    if len(all_pts) == 0:
+        return 0.0
+
+    all_c = (all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
+    tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
+    cos_t, sin_t = np.cos(angle), np.sin(angle)
+    nx_all = cos_t * all_c[:, 0] - sin_t * all_c[:, 1] + dxf_cx + tx
+    ny_all = sin_t * all_c[:, 0] + cos_t * all_c[:, 1] + dxf_cy + ty
+    valid = (nx_all >= 0) & (nx_all < W - 1) & (ny_all >= 0) & (ny_all < H - 1)
+
+    if valid.sum() > 0:
+        vals = map_coordinates(dist_t, [ny_all[valid], nx_all[valid]],
+                               order=1, mode="nearest", prefilter=False)
+        return float(np.mean(vals < max_error_px))
+    return 0.0
 
 
 def fit_complete(
@@ -362,7 +342,6 @@ def fit_complete(
         if effective_refine:
             print("Refine mode: no REFINE layer found — using ROT + PAN as fallback.")
 
-    # ── Step 1: Coarse fit on all layers ──────────────────────────────
     result_coarse = fit(
         polylines=polylines_all,
         edge_points=edge_points,
@@ -375,21 +354,17 @@ def fit_complete(
     angle_rad = np.radians(result_coarse.angle_deg)
     params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
 
-    # CAPTURE GLOBAL CENTROID
-    global_cx = result_coarse.dxf_cx
-    global_cy = result_coarse.dxf_cy
+    global_cx, global_cy = result_coarse.dxf_cx, result_coarse.dxf_cy
 
-    # ── Step 2: Refine on all layers ──────────────────────────────────
     params_2, cost_2, _, _ = _refine_from(
-        polylines_all, params_1, dist_t, n_sample=6000,
+        polylines_all, params_1, dist_t, n_sample=4000,
         objective=objective, max_error_px=max_error_px,
         dxf_cx=global_cx, dxf_cy=global_cy
     )
 
-    # ── Step 3: Finetune on REFINE layer ─────────────────────────────
     if effective_refine:
         params_3, cost_3, _, _ = _refine_from(
-            effective_refine, params_2, dist_t, n_sample=6000,
+            effective_refine, params_2, dist_t, n_sample=4000,
             objective=objective, max_error_px=max_error_px,
             dxf_cx=global_cx, dxf_cy=global_cy
         )
@@ -415,87 +390,6 @@ def fit_complete(
     )
 
 
-# ======================================================================
-# POC mode — 4-step pipeline (Position / Orientation / Centre)
-# Layers: GLOBAL, ROT, PAN
-# Step 1: Coarse   — all layers (GLOBAL + ROT + PAN), full (tx, ty, θ)
-# Step 2: Refine   — all layers (GLOBAL + ROT + PAN), full (tx, ty, θ)
-# Step 3: Finetune — ROT + PAN layers only,           full (tx, ty, θ)
-# Step 4: Pan      — PAN layer only,                  translation only (tx, ty), θ locked
-# ======================================================================
-
-def _refine_translation_only(
-        polylines: list[np.ndarray],
-        init_params: np.ndarray,
-        dist_t: np.ndarray,
-        n_sample: int = 6000,
-        maxiter: int = 20_000,
-        objective: str = "Strict",
-        max_error_px: float = 2.0,
-        dxf_cx: float | None = None,
-        dxf_cy: float | None = None,
-) -> tuple:
-    """
-    Powell refinement optimising **only tx, ty** while keeping θ locked.
-    Returns (optimized_params_3d, cost, dxf_cx, dxf_cy).
-    """
-    H, W = dist_t.shape
-    dxf_all = _sample_polylines(polylines, spacing=0.5)
-    if len(dxf_all) == 0:
-        raise ValueError("Polylines produced no sample points.")
-
-    dxf_sample = _stride_subsample(dxf_all, n=n_sample)
-
-    # Use provided global centroids, otherwise compute local ones
-    if dxf_cx is None or dxf_cy is None:
-        dxf_cx = float(dxf_all[:, 0].mean())
-        dxf_cy = float(dxf_all[:, 1].mean())
-
-    dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
-
-    theta_locked = float(init_params[2])
-    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
-                            objective=objective, max_error_px=max_error_px,
-                            locked_theta=theta_locked)
-
-    res = minimize(
-        cost_fn,
-        np.array([init_params[0], init_params[1]], dtype=np.float64),
-        method="Powell",
-        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": maxiter},
-    )
-    out_params = np.array([res.x[0], res.x[1], theta_locked])
-    return out_params, res.fun, dxf_cx, dxf_cy
-
-
-def _compute_inlier_frac(
-        polylines: list[np.ndarray],
-        params: np.ndarray,
-        dist_t: np.ndarray,
-        dxf_cx: float,
-        dxf_cy: float,
-        max_error_px: float = 2.0,
-) -> float:
-    """Compute inlier fraction (threshold = max_error_px) for given polylines + transform."""
-    H, W = dist_t.shape
-    all_pts = _sample_polylines(polylines, spacing=1.0)
-    if len(all_pts) == 0:
-        return 0.0
-
-    # Removed local centroid calculation to enforce global coordinate frame
-    all_c = (all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
-    tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
-    cos_t, sin_t = np.cos(angle), np.sin(angle)
-    nx_all = cos_t * all_c[:, 0] - sin_t * all_c[:, 1] + dxf_cx + tx
-    ny_all = sin_t * all_c[:, 0] + cos_t * all_c[:, 1] + dxf_cy + ty
-    valid = (nx_all >= 0) & (nx_all < W - 1) & (ny_all >= 0) & (ny_all < H - 1)
-    if valid.sum() > 0:
-        vals = map_coordinates(dist_t, [ny_all[valid], nx_all[valid]],
-                               order=1, mode="nearest", prefilter=False)
-        return float(np.mean(vals < max_error_px))
-    return 0.0
-
-
 def fit_poc(
         polylines_all: list[np.ndarray],
         polylines_rot: list[np.ndarray],
@@ -509,7 +403,6 @@ def fit_poc(
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
 
-    # ── Step 1: Coarse fit on all layers ──────────────────────────────
     result_coarse = fit(
         polylines=polylines_all,
         edge_points=edge_points,
@@ -522,31 +415,26 @@ def fit_poc(
     angle_rad = np.radians(result_coarse.angle_deg)
     params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
 
-    # CAPTURE GLOBAL CENTROID
-    global_cx = result_coarse.dxf_cx
-    global_cy = result_coarse.dxf_cy
+    global_cx, global_cy = result_coarse.dxf_cx, result_coarse.dxf_cy
 
-    # ── Step 2: Refine on all layers ──────────────────────────────────
     params_2, cost_2, _, _ = _refine_from(
-        polylines_all, params_1, dist_t, n_sample=6000,
+        polylines_all, params_1, dist_t, n_sample=4000,
         objective=objective, max_error_px=max_error_px,
         dxf_cx=global_cx, dxf_cy=global_cy
     )
 
-    # ── Step 3: Finetune on ROT layer only ───────────────────────────
     if polylines_rot:
         params_3, cost_3, _, _ = _refine_from(
-            polylines_rot, params_2, dist_t, n_sample=6000,
+            polylines_rot, params_2, dist_t, n_sample=4000,
             objective=objective, max_error_px=max_error_px,
             dxf_cx=global_cx, dxf_cy=global_cy
         )
     else:
         params_3, cost_3 = params_2, cost_2
 
-    # ── Step 4: Pan on PAN layer only ────────────────────────────────
     if polylines_pan:
         params_4, cost_4, _, _ = _refine_translation_only(
-            polylines_pan, params_3, dist_t, n_sample=6000,
+            polylines_pan, params_3, dist_t, n_sample=4000,
             objective=objective, max_error_px=max_error_px,
             dxf_cx=global_cx, dxf_cy=global_cy
         )
