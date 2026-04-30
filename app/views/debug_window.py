@@ -299,16 +299,10 @@ class DebugPreprocessingWindow(QDialog):
 
     _STAGE_ORDER = [
         ("gray",            "① Grayscale"),
-        ("bilateral",       "② Bilateral Filter (d=10, σc=120, σs=90)"),
-        ("thresh",          "③ Otsu Binary Threshold"),
-        ("mask",            "④ Silhouette Mask (largest interior blob)"),
-        ("edges_raw",       "⑤ Canny Edges (50–150, masked)"),
-        ("edges_final",     "⑥ Edges + Silhouette Boundary"),
-        ("edges_dev",       "⑦ Devernay Sub-pixel Edges"),
-        ("edges_combined",  "⑧ Combined Edges"),
-        ("distance_field",  "⑨ Distance Transform"),
-        ("edge_points_viz", "⑩ Edge Points Map"),
-        ("subpixel_overlay","⑪ Edge Overlay on Bilateral"),
+        ("mask",            "② Silhouette Mask (mode-adaptive Otsu)"),
+        ("edges_dev",       "③ GPU Devernay Sub-pixel Edges"),
+        ("edge_points_viz", "④ Sub-pixel Edge Points"),
+        ("distance_field",  "⑤ Distance Transform"),
     ]
 
     def __init__(self, parent=None) -> None:

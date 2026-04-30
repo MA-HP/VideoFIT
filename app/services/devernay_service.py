@@ -1,12 +1,141 @@
 """
-VideoFIT — Canny-Devernay Sub-pixel Edge Detector
-Vectorised NumPy + OpenCV implementation optimised for large sensors.
+VideoFIT — GPU-accelerated Canny-Devernay Sub-pixel Edge Detector
+CUDA kernels via CuPy: bilateral pre-smooth → fused Sobel → sub-pixel NMS
+with curvature rejection.
+
+Hysteresis runs on the CPU with OpenCV connected-components (faster than
+CuPy ndi.label for typical frame sizes due to lower kernel-launch overhead).
+Only valid sub-pixel coordinates are transferred back over PCIe (single batch).
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
+import cupy as cp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUDA kernels  (compiled once at import time)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_bilateral_src = r'''
+extern "C" __global__
+void bilateral_kernel(
+    const float* input, float* output,
+    int width, int height,
+    float sigma_s, float sigma_r, int radius)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    float center_val = input[y * width + x];
+    float sum = 0.0f, norm = 0.0f;
+    float var_s = 2.0f * sigma_s * sigma_s;
+    float var_r = 2.0f * sigma_r * sigma_r;
+
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            int nx = max(0, min(width - 1, x + dx));
+            int ny = max(0, min(height - 1, y + dy));
+            float val = input[ny * width + nx];
+            float space_dist2 = (float)(dx * dx + dy * dy);
+            float color_dist  = val - center_val;
+            float weight = expf(-(space_dist2 / var_s)
+                              - ((color_dist * color_dist) / var_r));
+            sum  += val * weight;
+            norm += weight;
+        }
+    }
+    output[y * width + x] = sum / norm;
+}
+'''
+
+_sobel_src = r'''
+extern "C" __global__
+void fused_sobel_kernel(
+    const float* input, float* Gx, float* Gy, float* G_mag,
+    int width, int height)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) return;
+
+    float p00 = input[(y-1)*width + (x-1)];
+    float p01 = input[(y-1)*width + x    ];
+    float p02 = input[(y-1)*width + (x+1)];
+    float p10 = input[y    *width + (x-1)];
+    float p12 = input[y    *width + (x+1)];
+    float p20 = input[(y+1)*width + (x-1)];
+    float p21 = input[(y+1)*width + x    ];
+    float p22 = input[(y+1)*width + (x+1)];
+
+    float gx = (p02 - p00) + 2.0f*(p12 - p10) + (p22 - p20);
+    float gy = (p20 - p00) + 2.0f*(p21 - p01) + (p22 - p02);
+
+    int idx = y * width + x;
+    Gx[idx]    = gx;
+    Gy[idx]    = gy;
+    G_mag[idx] = sqrtf(gx * gx + gy * gy);
+}
+'''
+
+_devernay_src = r'''
+extern "C" __global__
+void fast_devernay_kernel(
+    const float* Gx, const float* Gy, const float* G_mag,
+    float* out_x, float* out_y, bool* out_mask,
+    int width, int height, float low_thresh, float min_curvature)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) return;
+
+    int idx = y * width + x;
+    float mag0 = G_mag[idx];
+
+    if (mag0 < low_thresh) { out_mask[idx] = false; return; }
+
+    float gx = Gx[idx], gy = Gy[idx];
+    float abs_gx = abs(gx), abs_gy = abs(gy);
+    float mag_plus, mag_minus, dx_norm, dy_norm;
+
+    if (abs_gx > abs_gy) {
+        float weight = gy / (gx + 1e-6f);
+        mag_plus  = G_mag[y * width + (x + 1)];
+        mag_minus = G_mag[y * width + (x - 1)];
+        dx_norm = 1.0f; dy_norm = weight;
+    } else {
+        float weight = gx / (gy + 1e-6f);
+        mag_plus  = G_mag[(y + 1) * width + x];
+        mag_minus = G_mag[(y - 1) * width + x];
+        dx_norm = weight; dy_norm = 1.0f;
+    }
+
+    if (mag0 >= mag_plus && mag0 >= mag_minus) {
+        float curvature = abs(mag_minus - 2.0f * mag0 + mag_plus);
+        if (curvature < min_curvature) { out_mask[idx] = false; return; }
+
+        float denom = 2.0f * (mag_minus - 2.0f * mag0 + mag_plus) + 1e-6f;
+        float delta = (mag_minus - mag_plus) / denom;
+        delta = fmaxf(-0.5f, fminf(delta, 0.5f));
+
+        out_x[idx]    = (float)x + (delta * dx_norm);
+        out_y[idx]    = (float)y + (delta * dy_norm);
+        out_mask[idx] = true;
+    } else {
+        out_mask[idx] = false;
+    }
+}
+'''
+
+_k_bilateral = cp.RawKernel(_bilateral_src, 'bilateral_kernel',   options=('-use_fast_math',))
+_k_sobel     = cp.RawKernel(_sobel_src,     'fused_sobel_kernel',  options=('-use_fast_math',))
+_k_devernay  = cp.RawKernel(_devernay_src,  'fast_devernay_kernel', options=('-use_fast_math',))
+
+# Structuring element reused for CPU morphological close
+_CPU_CLOSE_K = np.ones((3, 3), dtype=np.uint8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -16,57 +145,133 @@ import numpy as np
 def devernay_edges(
     gray: np.ndarray,
     sigma: float = 0.0,
-    high_thresh: float = 20.0,
-    low_thresh: float = 10.0,
+    high_thresh: float = 50.0,
+    low_thresh: float = 15.0,
     mask: np.ndarray | None = None,
-    downsample: float = 0.5,
+    downsample: float = 1.0,
+    min_curvature: float = 2.0,
+    min_edge_length: int = 15,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Sub-pixel Canny-Devernay edge detection.
+    GPU sub-pixel Canny-Devernay edge detection.
+
+    Returns
+    -------
+    ex, ey   : float32 (H, W) — sub-pixel coordinates; -1 where no edge.
+    edge_map : uint8  (H, W) — rasterised edge pixels.
     """
     H, W = gray.shape[:2]
 
-    # ── 1. Downsample ────────────────────────────────────────────────
+    # ── 1. Optional downsample ───────────────────────────────────────
     if downsample != 1.0:
         small_w = max(1, int(W * downsample))
         small_h = max(1, int(H * downsample))
-        small = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
-        small_mask = (
+        work = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        work_mask = (
             cv2.resize(mask, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
             if mask is not None else None
         )
     else:
-        small, small_mask = gray, mask
+        work, work_mask = gray, mask
         small_h, small_w = H, W
 
-    # ── 2. Pre-smoothing ─────────────────────────────────────────────
-    img = small.astype(np.float32)
-    if sigma > 0.0:
-        ks = int(2 * np.ceil(3 * sigma) + 1) | 1
-        img = cv2.GaussianBlur(img, (ks, ks), sigma)
+    # ── 2. Upload → normalise ────────────────────────────────────────
+    cp_frame = cp.asarray(work, dtype=cp.float32)
+    height, width = cp_frame.shape
 
-    # ── 3. Gradient via Sobel (OpenCV SIMD) ──────────────────────────
-    Gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-    Gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
-    modG = cv2.magnitude(Gx, Gy)
+    block = (16, 16)
+    grid  = ((width + 15) // 16, (height + 15) // 16)
 
-    # ── 4. Sub-pixel NMS (Optimized Mask-Early approach) ─────────────
-    ex_s, ey_s = _subpixel_nms(Gx, Gy, modG, small_h, small_w)
+    f_min, f_max = cp_frame.min(), cp_frame.max()
+    cp_frame = (cp_frame - f_min) * (255.0 / (f_max - f_min + 1e-6))
 
-    # ── 5. Hysteresis ────────────────────────────────────────────────
-    ex_s, ey_s = _hysteresis(ex_s, ey_s, modG, high_thresh, low_thresh)
+    # ── 3. GPU bilateral pre-smooth ──────────────────────────────────
+    bil_sigma_s = max(1.0, sigma * 10.0) if sigma > 0.0 else 2.0
+    bil_radius  = max(2, int(3 * sigma)) if sigma > 0.0 else 2
+    filtered = cp.empty_like(cp_frame)
+    _k_bilateral(
+        grid, block,
+        (cp_frame, filtered, width, height,
+         cp.float32(bil_sigma_s), cp.float32(25.0), bil_radius)
+    )
 
-    # ── 6. Apply mask (small-res) ────────────────────────────────────
-    if small_mask is not None:
-        ex_s[small_mask == 0] = -1.0
-        ey_s[small_mask == 0] = -1.0
+    # ── 4. GPU fused Sobel ───────────────────────────────────────────
+    Gx    = cp.empty_like(cp_frame)
+    Gy    = cp.empty_like(cp_frame)
+    G_mag = cp.empty_like(cp_frame)
+    _k_sobel(grid, block, (filtered, Gx, Gy, G_mag, width, height))
 
-    # ── 7. Scale coordinates back to full resolution ─────────────────
+    # ── 5. GPU sub-pixel NMS + curvature rejection ───────────────────
+    out_x    = cp.empty_like(G_mag)
+    out_y    = cp.empty_like(G_mag)
+    out_mask = cp.zeros(G_mag.shape, dtype=cp.bool_)
+    _k_devernay(
+        grid, block,
+        (Gx, Gy, G_mag, out_x, out_y, out_mask,
+         width, height, cp.float32(low_thresh), cp.float32(min_curvature))
+    )
+
+    # ── 6. Minimal PCIe download for CPU hysteresis ──────────────────
+    # Only transfer out_mask (~1.4 MB) and G_mag (~5.8 MB) — not out_x/out_y.
+    # CuPy ndi.label has high kernel-launch overhead; OpenCV connectedComponents
+    # on CPU is faster for typical frame sizes (≤ 4 MP).
+    out_mask_np = cp.asnumpy(out_mask)   # bool   (H, W)
+    G_mag_np    = cp.asnumpy(G_mag)      # float32 (H, W)
+
+    # ── 7. CPU hysteresis ────────────────────────────────────────────
+    # 7a. Morphological close: bridge 1-pixel gaps in NMS output
+    closed = cv2.morphologyEx(
+        out_mask_np.view(np.uint8), cv2.MORPH_CLOSE, _CPU_CLOSE_K
+    )
+
+    # 7b. Connected components
+    _, labels, _, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    num_features = int(labels.max())
+
+    if num_features > 0:
+        comp_sizes    = np.bincount(labels.ravel())
+        strong_pixels = out_mask_np & (G_mag_np > high_thresh)
+        strong_labels = np.unique(labels[strong_pixels])
+        has_strong    = np.zeros(num_features + 1, dtype=bool)
+        has_strong[strong_labels] = True
+        valid_labels  = (comp_sizes >= min_edge_length) & has_strong
+        valid_labels[0] = False
+        clean_np      = out_mask_np & valid_labels[labels]
+    else:
+        clean_np = out_mask_np
+
+    # 7c. Apply spatial mask
+    if work_mask is not None:
+        clean_np = clean_np & (work_mask > 0)
+
+    # ── 8. Single batched PCIe handover (valid coords only) ──────────
+    # Upload the small boolean mask, index out_x/out_y on the GPU,
+    # then download only the N valid (x, y) pairs — identical to the
+    # test script strategy.
+    clean_gpu  = cp.asarray(clean_np)
+    coords_gpu = cp.column_stack((out_x[clean_gpu], out_y[clean_gpu]))
+    coords_cpu = cp.asnumpy(coords_gpu)   # shape (N, 2)
+
+    # ── 9. Reconstruct (H, W) coordinate arrays ──────────────────────
+    # The ±0.5 clamp in the CUDA kernel guarantees round(sub_pixel) == grid,
+    # so integer indices derived from coords_cpu match the source grid cells.
+    ex_s = np.full((small_h, small_w), -1.0, dtype=np.float32)
+    ey_s = np.full((small_h, small_w), -1.0, dtype=np.float32)
+
+    if len(coords_cpu) > 0:
+        xs   = coords_cpu[:, 0]
+        ys   = coords_cpu[:, 1]
+        xs_i = np.round(xs).astype(np.int32).clip(0, small_w - 1)
+        ys_i = np.round(ys).astype(np.int32).clip(0, small_h - 1)
+        ex_s[ys_i, xs_i] = xs
+        ey_s[ys_i, xs_i] = ys
+
+    # ── 10. Optional upscale back to full resolution ──────────────────
     if downsample != 1.0:
-        inv = 1.0 / downsample
+        inv   = 1.0 / downsample
         valid = ex_s >= 0.0
-        ex = np.full((H, W), -1.0, dtype=np.float32)
-        ey = np.full((H, W), -1.0, dtype=np.float32)
+        ex    = np.full((H, W), -1.0, dtype=np.float32)
+        ey    = np.full((H, W), -1.0, dtype=np.float32)
 
         ys_s = np.round(ey_s[valid]).astype(np.int32).clip(0, small_h - 1)
         xs_s = np.round(ex_s[valid]).astype(np.int32).clip(0, small_w - 1)
@@ -78,98 +283,14 @@ def devernay_edges(
     else:
         ex, ey = ex_s, ey_s
 
-    # ── 8. Render edge map ───────────────────────────────────────────
+    # ── 11. Render edge map ───────────────────────────────────────────
     edge_map = _render_edge_map(ex, ey, H, W)
-
     return ex, ey, edge_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _subpixel_nms(
-    Gx: np.ndarray,
-    Gy: np.ndarray,
-    modG: np.ndarray,
-    h: int,
-    w: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Optimized pure-NumPy sub-pixel NMS (Mask Early, Compute Late)."""
-    ex = np.full((h, w), -1.0, dtype=np.float32)
-    ey = np.full((h, w), -1.0, dtype=np.float32)
-
-    mod  = modG[1:-1, 1:-1]
-    gx_a = np.abs(Gx[1:-1, 1:-1])
-    gy_a = np.abs(Gy[1:-1, 1:-1])
-
-    L = modG[1:-1, :-2]
-    R = modG[1:-1, 2:]
-    D = modG[:-2, 1:-1]
-    U = modG[2:,  1:-1]
-
-    # ── Case A: horizontal suppression (|Gx| >= |Gy|) ────────────────
-    caseA = (gx_a >= gy_a) & (mod > L) & (mod >= R)
-    ys_A, xs_A = np.nonzero(caseA)
-
-    if len(ys_A) > 0:
-        mod_A = mod[ys_A, xs_A]
-        L_A = L[ys_A, xs_A]
-        R_A = R[ys_A, xs_A]
-
-        dA = L_A - 2.0 * mod_A + R_A
-        valid_A = np.abs(dA) > 1e-6
-
-        offA = np.zeros_like(dA)
-        offA[valid_A] = np.clip(0.5 * (L_A[valid_A] - R_A[valid_A]) / dA[valid_A], -0.5, 0.5)
-
-        ex[ys_A + 1, xs_A + 1] = xs_A + 1 + offA
-        ey[ys_A + 1, xs_A + 1] = ys_A + 1
-
-    # ── Case B: vertical suppression (|Gy| > |Gx|) ───────────────────
-    caseB = (gy_a > gx_a) & (mod > D) & (mod >= U)
-    ys_B, xs_B = np.nonzero(caseB)
-
-    if len(ys_B) > 0:
-        mod_B = mod[ys_B, xs_B]
-        D_B = D[ys_B, xs_B]
-        U_B = U[ys_B, xs_B]
-
-        dB = D_B - 2.0 * mod_B + U_B
-        valid_B = np.abs(dB) > 1e-6
-
-        offB = np.zeros_like(dB)
-        offB[valid_B] = np.clip(0.5 * (D_B[valid_B] - U_B[valid_B]) / dB[valid_B], -0.5, 0.5)
-
-        ex[ys_B + 1, xs_B + 1] = xs_B + 1
-        ey[ys_B + 1, xs_B + 1] = ys_B + 1 + offB
-
-    return ex, ey
-
-
-def _hysteresis(
-    ex: np.ndarray,
-    ey: np.ndarray,
-    modG: np.ndarray,
-    high: float,
-    low: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    has_edge = ex >= 0.0
-    strong = has_edge & (modG >= high)
-    weak   = has_edge & (modG >= low)
-
-    _, labels = cv2.connectedComponents(weak.view(np.uint8), connectivity=8)
-
-    strong_labels = np.unique(labels[strong])
-    keep_lut = np.zeros(labels.max() + 1, dtype=bool)
-    keep_lut[strong_labels] = True
-    keep_lut[0] = False
-
-    keep = keep_lut[labels]
-    ex = np.where(keep, ex, np.float32(-1.0))
-    ey = np.where(keep, ey, np.float32(-1.0))
-    return ex, ey
-
 
 def _render_edge_map(ex: np.ndarray, ey: np.ndarray, h: int, w: int) -> np.ndarray:
     edge_map = np.zeros((h, w), dtype=np.uint8)
