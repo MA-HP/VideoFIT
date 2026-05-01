@@ -299,10 +299,9 @@ class DebugPreprocessingWindow(QDialog):
 
     _STAGE_ORDER = [
         ("gray",            "① Grayscale"),
-        ("mask",            "② Silhouette Mask (mode-adaptive Otsu)"),
-        ("edges_dev",       "③ GPU Devernay Sub-pixel Edges"),
-        ("edge_points_viz", "④ Sub-pixel Edge Points"),
-        ("distance_field",  "⑤ Distance Transform"),
+        ("edges_dev",       "② GPU Devernay Sub-pixel Edges"),
+        ("edge_points_viz", "③ Sub-pixel Edge Points"),
+        ("distance_field",  "④ Distance Transform"),
     ]
 
     def __init__(self, parent=None) -> None:

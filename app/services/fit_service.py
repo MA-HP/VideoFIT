@@ -2,8 +2,11 @@
 VideoFIT — Fit Service
 Aligns DXF polylines onto a distance field built from sub-pixel Devernay edges.
 
-Refactored to include Coarse-to-Fine multi-scale fields, Grid + Angle sweeping,
-and a continuous Pseudo-Huber loss function to prevent Powell optimization cliffs.
+Texture-Robust Metrology Refactor:
+- Removed heavy EDT blurring (which creates sinkholes in texture regions).
+- Dual-Loss Pipeline: Uses Huber loss for global pulling, and Welsch (redescending)
+  loss for final refinement to mathematically ignore texture and outliers without
+  creating cliffs for the Powell optimizer.
 """
 
 from __future__ import annotations
@@ -21,9 +24,11 @@ def _make_cost_fn(
         dxf_cx: float,
         dxf_cy: float,
         dist_t: np.ndarray,
-        objective: str = "Strict",
-        max_error_px: float = 2.0,
+        loss_type: str = "Huber",  # "Huber" (pulls globally) or "Welsch" (ignores texture)
+        objective: str = "Tolerance",
+        max_error_px: float = 1.0,
         locked_theta: float | None = None,
+        interp_order: int = 1,
 ) -> callable:
     H, W = dist_t.shape
     _OOB_DIST = float(max(H, W))
@@ -33,7 +38,8 @@ def _make_cost_fn(
         out = np.full(len(nx), _OOB_DIST, dtype=np.float64)
         if in_b.sum() >= 10:
             out[in_b] = map_coordinates(
-                dist_t, [ny[in_b], nx[in_b]], order=1, mode="nearest", prefilter=False
+                dist_t, [ny[in_b], nx[in_b]],
+                order=interp_order, mode="nearest", prefilter=False
             )
         return out, in_b
 
@@ -44,15 +50,22 @@ def _make_cost_fn(
         return nx, ny
 
     def _calc_huber_cost(vals):
-        """
-        Pseudo-Huber loss function.
-        Replaces hard-trimming (which causes cliffs for Powell).
-        Smoothly transitions from L2 (quadratic) for inliers to L1 (linear) for outliers.
-        """
-        delta = max(0.5, max_error_px)  # Use max_error_px as the transition boundary
-        # If tolerance mode, we flatten the curve slightly more for outliers
+        """Pulls from anywhere in the image. Great for initial sweeps."""
+        delta = max(0.5, max_error_px)
         weight = 0.5 if objective == "Tolerance" else 1.0
         return float(np.mean(weight * delta**2 * (np.sqrt(1 + (vals / delta)**2) - 1)))
+
+    def _calc_welsch_cost(vals):
+        """
+        Redescending Robust Loss.
+        As 'vals' exceeds max_error_px, the penalty caps out at 1.0 and the gradient
+        drops to 0. This makes distant texture completely invisible to the optimizer.
+        """
+        delta = max(0.5, max_error_px)
+        # 1.0 - exp(...) maps distance 0 -> 0, and distance infinity -> 1.0
+        return float(np.mean(1.0 - np.exp(-0.5 * (vals / delta)**2)))
+
+    _loss_func = _calc_welsch_cost if loss_type == "Welsch" else _calc_huber_cost
 
     if locked_theta is not None:
         theta_fixed = float(locked_theta)
@@ -67,7 +80,7 @@ def _make_cost_fn(
             vals, in_b = _sample_dist(nx, ny)
             if in_b.sum() < 10:
                 return _OOB_DIST
-            return _calc_huber_cost(vals)
+            return _loss_func(vals)
 
     else:
         def cost_fn(params):
@@ -76,7 +89,7 @@ def _make_cost_fn(
             vals, in_b = _sample_dist(nx, ny)
             if in_b.sum() < 10:
                 return _OOB_DIST
-            return _calc_huber_cost(vals)
+            return _loss_func(vals)
 
     return cost_fn
 
@@ -108,92 +121,138 @@ def _stride_subsample(pts: np.ndarray, n: int) -> np.ndarray:
 def fit(
         polylines: list[np.ndarray],
         edge_points: np.ndarray,
-        silhouette_mask: np.ndarray,
+        silhouette_mask: np.ndarray | None = None,
         distance_field: np.ndarray | None = None,
-        objective: str = "Strict",
-        max_error_px: float = 2.0,
+        objective: str = "Tolerance",
+        max_error_px: float = 1.0,
 ) -> FitResult:
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
 
     H, W = distance_field.shape
 
-    # ── Step 1: Pre-smooth (Coarse-to-Fine) ───────────────────────────
-    # Coarse field provides a massive basin for the global sweep
-    dist_coarse = gaussian_filter(distance_field.astype(np.float32), sigma=5.0)
-    # Fine field provides the exact geometry for Powell refinement
-    dist_fine = gaussian_filter(distance_field.astype(np.float32), sigma=1.5)
+    # ── Step 1: Micro-Smooth Only ─────────────────────────────────────
+    # Do NOT blur heavily. We only use a tiny blur to fix pixel-grid aliasing.
+    dist_smooth = gaussian_filter(distance_field.astype(np.float32), sigma=0.5)
 
-    # ── Step 2: Dense deterministic DXF sample ────────────────────────
+    # ── Step 2: DXF samples ───────────────────────────────────────────
     dxf_all = _sample_polylines(polylines, spacing=0.5)
     if len(dxf_all) == 0:
         raise ValueError("DXF polylines produced no sample points.")
 
-    # HARDCODED strictly to 4000 across the entire file for repeatability
+    dxf_sweep  = _stride_subsample(dxf_all, n=600)
     dxf_sample = _stride_subsample(dxf_all, n=4000)
 
     # ── Step 3: Centroids ─────────────────────────────────────────────
     dxf_cx = float(dxf_all[:, 0].mean())
     dxf_cy = float(dxf_all[:, 1].mean())
 
-    M_scene = cv2.moments(silhouette_mask)
-    scene_cx = float(M_scene["m10"] / max(M_scene["m00"], 1))
-    scene_cy = float(M_scene["m01"] / max(M_scene["m00"], 1))
+    if silhouette_mask is not None and silhouette_mask.any():
+        M_scene = cv2.moments(silhouette_mask)
+        scene_cx = float(M_scene["m10"] / max(M_scene["m00"], 1))
+        scene_cy = float(M_scene["m01"] / max(M_scene["m00"], 1))
+    elif edge_points is not None and len(edge_points) > 0:
+        scene_cx = float(np.median(edge_points[:, 0]))
+        scene_cy = float(np.median(edge_points[:, 1]))
+    else:
+        scene_cx, scene_cy = W / 2.0, H / 2.0
 
     tx_init = scene_cx - dxf_cx
     ty_init = scene_cy - dxf_cy
 
-    # ── Step 4: Cost functions ────────────────────────────────────────
-    dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
+    # ── Step 4: Centred coordinate arrays & Cost Functions ────────────
+    centroid = np.array([dxf_cx, dxf_cy], dtype=np.float32)
+    dxf_c_sweep = (dxf_sweep  - centroid).astype(np.float64)
+    dxf_c       = (dxf_sample - centroid).astype(np.float64)
 
-    cost_coarse = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_coarse,
-                                objective=objective, max_error_px=max_error_px)
+    # SWEEP/PULL: Huber loss (to pull from far away)
+    cost_pull = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_smooth,
+                              loss_type="Huber", objective=objective,
+                              max_error_px=max_error_px, interp_order=1)
 
-    cost_fine = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_fine,
-                              objective=objective, max_error_px=max_error_px)
+    # POLISH: Welsch loss + Bicubic (ignores texture entirely, snaps to edge)
+    cost_polish = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_smooth,
+                                loss_type="Welsch", objective=objective,
+                                max_error_px=max_error_px, interp_order=3)
 
-    # ── Step 5: Vectorised coarse X/Y Grid + Angle sweep ──────────────
-    angles = np.linspace(-np.pi, np.pi, 90, endpoint=False)
-    grid_offsets = [-8.0, 0.0, 8.0] # 3x3 pixel grid around centroid to escape traps
+    # ── Step 5: Fully-vectorised coarse X/Y grid + angle sweep ────────
+    angles = np.linspace(-np.pi, np.pi, 180, endpoint=False)
+    grid_offsets = np.linspace(-24.0, 24.0, 9)
 
-    sweep_results = []
-    for dx in grid_offsets:
-        for dy in grid_offsets:
-            for a in angles:
-                c = cost_coarse([tx_init + dx, ty_init + dy, a])
-                sweep_results.append((c, [tx_init + dx, ty_init + dy, a]))
+    _OOB_D   = float(max(H, W))
+    delta_c  = max(0.5, max_error_px * 5.0)
+    weight_c = 0.5 if objective == "Tolerance" else 1.0
+    n_angles = len(angles)
+    n_sweep  = len(dxf_c_sweep)
 
-    # Sort by cost and grab the top 3 candidates globally
-    sweep_results.sort(key=lambda x: x[0])
-    top_candidates = [res[1] for res in sweep_results[:3]]
+    cos_a  = np.cos(angles)
+    sin_a  = np.sin(angles)
+    nx_rot = cos_a[:, None] * dxf_c_sweep[:, 0] - sin_a[:, None] * dxf_c_sweep[:, 1]
+    ny_rot = sin_a[:, None] * dxf_c_sweep[:, 0] + cos_a[:, None] * dxf_c_sweep[:, 1]
 
-    # ── Step 6: Coarse-to-Fine Powell refinement ──────────────────────
+    all_costs = np.full((len(grid_offsets), len(grid_offsets), n_angles), _OOB_D)
+
+    for i, dx in enumerate(grid_offsets):
+        for j, dy in enumerate(grid_offsets):
+            tx = tx_init + dx
+            ty = ty_init + dy
+            nx = nx_rot + (dxf_cx + tx)
+            ny = ny_rot + (dxf_cy + ty)
+            nx_f = nx.ravel()
+            ny_f = ny.ravel()
+            in_b = (nx_f >= 0) & (nx_f < W - 1) & (ny_f >= 0) & (ny_f < H - 1)
+            vals_f = np.full(len(nx_f), _OOB_D, dtype=np.float64)
+            if in_b.any():
+                vals_f[in_b] = map_coordinates(
+                    dist_smooth, [ny_f[in_b], nx_f[in_b]],
+                    order=1, mode="nearest", prefilter=False,
+                )
+            vals = vals_f.reshape(n_angles, n_sweep)
+
+            # Vectorized Huber calculation for the sweep
+            all_costs[i, j] = np.mean(
+                weight_c * delta_c ** 2 * (np.sqrt(1.0 + (vals / delta_c) ** 2) - 1.0),
+                axis=1,
+            )
+
+    flat     = all_costs.ravel()
+    top_flat = np.argpartition(flat, min(5, len(flat) - 1))[:5]
+    top_flat = top_flat[np.argsort(flat[top_flat])]
+    top_candidates = []
+    for flat_i in top_flat:
+        gi, gj, ak = np.unravel_index(int(flat_i), all_costs.shape)
+        top_candidates.append(
+            [tx_init + grid_offsets[gi], ty_init + grid_offsets[gj], angles[ak]]
+        )
+
+    # ── Step 6: Powell Refinement ─────────────────────────────────────
     best_res = None
 
-    # 6a. Loose search on top 3 using the fine distance field
+    # Stage A: Loose pass on top-5 using Huber (pulls out of local ruts)
     for candidate in top_candidates:
         res = minimize(
-            cost_fine,
+            cost_pull,
             np.array(candidate, dtype=np.float64),
             method="Powell",
-            options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 50},
+            options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 25},
         )
         if best_res is None or res.fun < best_res.fun:
             best_res = res
 
-    # 6b. Strict search on the absolute winner on the fine distance field
+    # Stage B: Strict tightening on winner using Welsch.
+    # This zeroes out the texture gradient and snaps to the true edge.
     final_res = minimize(
-        cost_fine,
+        cost_polish,
         best_res.x,
         method="Powell",
-        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": 300},
+        options={"xtol": 1e-5, "ftol": 1e-6, "maxiter": 150},
     )
 
     tx_opt, ty_opt, angle_opt = final_res.x
 
     # ── Step 7: Inlier fraction ───────────────────────────────────────
     inlier_frac = _compute_inlier_frac(
-        polylines, final_res.x, dist_fine, dxf_cx, dxf_cy, max_error_px
+        polylines, final_res.x, dist_smooth, dxf_cx, dxf_cy, max_error_px
     )
 
     return FitResult(
@@ -204,7 +263,7 @@ def fit(
         dxf_cx=dxf_cx,
         dxf_cy=dxf_cy,
         inlier_frac=inlier_frac,
-        dist_t=dist_fine, # Export the fine field for downstream refinement
+        dist_t=dist_smooth,
         dist_raw=distance_field.astype(np.float32),
     )
 
@@ -219,8 +278,8 @@ def _refine_from(
         dist_t: np.ndarray,
         n_sample: int = 4000,
         maxiter: int = 300,
-        objective: str = "Strict",
-        max_error_px: float = 2.0,
+        objective: str = "Tolerance",
+        max_error_px: float = 1.0,
         dxf_cx: float | None = None,
         dxf_cy: float | None = None,
 ) -> tuple:
@@ -237,14 +296,15 @@ def _refine_from(
 
     dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
 
-    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
-                            objective=objective, max_error_px=max_error_px)
+    # Downstream refinements are strictly metrology polish. Use Welsch.
+    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t, loss_type="Welsch",
+                            objective=objective, max_error_px=max_error_px, interp_order=3)
 
     res = minimize(
         cost_fn,
         init_params.astype(np.float64),
         method="Powell",
-        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": maxiter},
+        options={"xtol": 1e-5, "ftol": 1e-6, "maxiter": maxiter},
     )
     return res.x, res.fun, dxf_cx, dxf_cy
 
@@ -255,8 +315,8 @@ def _refine_translation_only(
         dist_t: np.ndarray,
         n_sample: int = 4000,
         maxiter: int = 300,
-        objective: str = "Strict",
-        max_error_px: float = 2.0,
+        objective: str = "Tolerance",
+        max_error_px: float = 1.0,
         dxf_cx: float | None = None,
         dxf_cy: float | None = None,
 ) -> tuple:
@@ -273,15 +333,16 @@ def _refine_translation_only(
 
     dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
     theta_locked = float(init_params[2])
-    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t,
+
+    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t, loss_type="Welsch",
                             objective=objective, max_error_px=max_error_px,
-                            locked_theta=theta_locked)
+                            locked_theta=theta_locked, interp_order=3)
 
     res = minimize(
         cost_fn,
         np.array([init_params[0], init_params[1]], dtype=np.float64),
         method="Powell",
-        options={"xtol": 1e-4, "ftol": 1e-5, "maxiter": maxiter},
+        options={"xtol": 1e-5, "ftol": 1e-6, "maxiter": maxiter},
     )
     out_params = np.array([res.x[0], res.x[1], theta_locked])
     return out_params, res.fun, dxf_cx, dxf_cy
@@ -293,7 +354,7 @@ def _compute_inlier_frac(
         dist_t: np.ndarray,
         dxf_cx: float,
         dxf_cy: float,
-        max_error_px: float = 2.0,
+        max_error_px: float = 1.0,
 ) -> float:
     H, W = dist_t.shape
     all_pts = _sample_polylines(polylines, spacing=1.0)
@@ -318,12 +379,12 @@ def fit_complete(
         polylines_all: list[np.ndarray],
         polylines_refine: list[np.ndarray],
         edge_points: np.ndarray,
-        silhouette_mask: np.ndarray,
+        silhouette_mask: np.ndarray | None = None,
         distance_field: np.ndarray | None = None,
         polylines_rot: list[np.ndarray] | None = None,
         polylines_pan: list[np.ndarray] | None = None,
-        objective: str = "Strict",
-        max_error_px: float = 2.0,
+        objective: str = "Tolerance",
+        max_error_px: float = 1.0,
 ) -> FitResult:
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
@@ -387,10 +448,10 @@ def fit_poc(
         polylines_rot: list[np.ndarray],
         polylines_pan: list[np.ndarray],
         edge_points: np.ndarray,
-        silhouette_mask: np.ndarray,
+        silhouette_mask: np.ndarray | None = None,
         distance_field: np.ndarray | None = None,
-        objective: str = "Strict",
-        max_error_px: float = 2.0,
+        objective: str = "Tolerance",
+        max_error_px: float = 1.0,
 ) -> FitResult:
     if distance_field is None:
         raise ValueError("distance_field is required for fitting.")
