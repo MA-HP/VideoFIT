@@ -5,7 +5,8 @@ with curvature rejection.
 
 Hysteresis runs on the CPU with OpenCV connected-components (faster than
 CuPy ndi.label for typical frame sizes due to lower kernel-launch overhead).
-Only valid sub-pixel coordinates are transferred back over PCIe (single batch).
+Valid sub-pixel coordinates are reconstructed and scaled entirely on the GPU,
+with only the final results downloaded over PCIe.
 """
 
 from __future__ import annotations
@@ -212,19 +213,14 @@ def devernay_edges(
     )
 
     # ── 6. Minimal PCIe download for CPU hysteresis ──────────────────
-    # Only transfer out_mask (~1.4 MB) and G_mag (~5.8 MB) — not out_x/out_y.
-    # CuPy ndi.label has high kernel-launch overhead; OpenCV connectedComponents
-    # on CPU is faster for typical frame sizes (≤ 4 MP).
     out_mask_np = cp.asnumpy(out_mask)   # bool   (H, W)
     G_mag_np    = cp.asnumpy(G_mag)      # float32 (H, W)
 
     # ── 7. CPU hysteresis ────────────────────────────────────────────
-    # 7a. Morphological close: bridge 1-pixel gaps in NMS output
     closed = cv2.morphologyEx(
         out_mask_np.view(np.uint8), cv2.MORPH_CLOSE, _CPU_CLOSE_K
     )
 
-    # 7b. Connected components
     _, labels, _, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
     num_features = int(labels.max())
 
@@ -240,62 +236,54 @@ def devernay_edges(
     else:
         clean_np = out_mask_np
 
-    # 7c. Apply spatial mask
     if work_mask is not None:
         clean_np = clean_np & (work_mask > 0)
 
-    # ── 8. Single batched PCIe handover (valid coords only) ──────────
-    # Upload the small boolean mask, index out_x/out_y on the GPU,
-    # then download only the N valid (x, y) pairs — identical to the
-    # test script strategy.
-    clean_gpu  = cp.asarray(clean_np)
-    coords_gpu = cp.column_stack((out_x[clean_gpu], out_y[clean_gpu]))
-    coords_cpu = cp.asnumpy(coords_gpu)   # shape (N, 2)
+    # ── 8. Upload valid mask back to GPU ─────────────────────────────
+    # Send the cleaned boolean mask back to filter the original arrays
+    clean_gpu = cp.asarray(clean_np)
 
-    # ── 9. Reconstruct (H, W) coordinate arrays ──────────────────────
-    # The ±0.5 clamp in the CUDA kernel guarantees round(sub_pixel) == grid,
-    # so integer indices derived from coords_cpu match the source grid cells.
-    ex_s = np.full((small_h, small_w), -1.0, dtype=np.float32)
-    ey_s = np.full((small_h, small_w), -1.0, dtype=np.float32)
+    # ── 9. Reconstruct (H, W) coordinate arrays on GPU ───────────────
+    xs = out_x[clean_gpu]
+    ys = out_y[clean_gpu]
 
-    if len(coords_cpu) > 0:
-        xs   = coords_cpu[:, 0]
-        ys   = coords_cpu[:, 1]
-        xs_i = np.round(xs).astype(np.int32).clip(0, small_w - 1)
-        ys_i = np.round(ys).astype(np.int32).clip(0, small_h - 1)
+    ex_s = cp.full((small_h, small_w), -1.0, dtype=cp.float32)
+    ey_s = cp.full((small_h, small_w), -1.0, dtype=cp.float32)
+
+    if xs.size > 0:
+        xs_i = cp.round(xs).astype(cp.int32).clip(0, small_w - 1)
+        ys_i = cp.round(ys).astype(cp.int32).clip(0, small_h - 1)
         ex_s[ys_i, xs_i] = xs
         ey_s[ys_i, xs_i] = ys
 
-    # ── 10. Optional upscale back to full resolution ──────────────────
+    # ── 10. Optional upscale back to full resolution (GPU) ────────────
     if downsample != 1.0:
-        inv   = 1.0 / downsample
+        inv = 1.0 / downsample
         valid = ex_s >= 0.0
-        ex    = np.full((H, W), -1.0, dtype=np.float32)
-        ey    = np.full((H, W), -1.0, dtype=np.float32)
 
-        ys_s = np.round(ey_s[valid]).astype(np.int32).clip(0, small_h - 1)
-        xs_s = np.round(ex_s[valid]).astype(np.int32).clip(0, small_w - 1)
-        ys_f = np.round(ey_s[valid] * inv).astype(np.int32).clip(0, H - 1)
-        xs_f = np.round(ex_s[valid] * inv).astype(np.int32).clip(0, W - 1)
+        ex = cp.full((H, W), -1.0, dtype=cp.float32)
+        ey = cp.full((H, W), -1.0, dtype=cp.float32)
+
+        ex_valid = ex_s[valid]
+        ey_valid = ey_s[valid]
+
+        ys_s = cp.round(ey_valid).astype(cp.int32).clip(0, small_h - 1)
+        xs_s = cp.round(ex_valid).astype(cp.int32).clip(0, small_w - 1)
+        ys_f = cp.round(ey_valid * inv).astype(cp.int32).clip(0, H - 1)
+        xs_f = cp.round(ex_valid * inv).astype(cp.int32).clip(0, W - 1)
 
         ex[ys_f, xs_f] = ex_s[ys_s, xs_s] * inv
         ey[ys_f, xs_f] = ey_s[ys_s, xs_s] * inv
     else:
         ex, ey = ex_s, ey_s
 
-    # ── 11. Render edge map ───────────────────────────────────────────
-    edge_map = _render_edge_map(ex, ey, H, W)
-    return ex, ey, edge_map
+    # ── 11. Render edge map on GPU & Final Download ───────────────────
+    edge_map = cp.zeros((H, W), dtype=cp.uint8)
+    valid_final = ex >= 0.0
 
+    if valid_final.any():
+        ys_render = cp.round(ey[valid_final]).astype(cp.int32).clip(0, H - 1)
+        xs_render = cp.round(ex[valid_final]).astype(cp.int32).clip(0, W - 1)
+        edge_map[ys_render, xs_render] = 255
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _render_edge_map(ex: np.ndarray, ey: np.ndarray, h: int, w: int) -> np.ndarray:
-    edge_map = np.zeros((h, w), dtype=np.uint8)
-    valid = ex >= 0.0
-    ys = np.round(ey[valid]).astype(np.int32).clip(0, h - 1)
-    xs = np.round(ex[valid]).astype(np.int32).clip(0, w - 1)
-    edge_map[ys, xs] = 255
-    return edge_map
+    return cp.asnumpy(ex), cp.asnumpy(ey), cp.asnumpy(edge_map)

@@ -2,94 +2,197 @@
 VideoFIT — Fit Service
 Aligns DXF polylines onto a distance field built from sub-pixel Devernay edges.
 
-Texture-Robust Metrology Refactor:
-- Removed heavy EDT blurring (which creates sinkholes in texture regions).
-- Dual-Loss Pipeline: Uses Huber loss for global pulling, and Welsch (redescending)
-  loss for final refinement to mathematically ignore texture and outliers without
-  creating cliffs for the Powell optimizer.
+Resolution-Independent Metrology Refactor:
+- Dynamic Scaling: All spatial constants (grids, margins, radii) are calculated
+  as percentages of the image diagonal to support multiple camera resolutions.
+- Blob-Locked Centroids: Utilizes connected components to isolate the largest
+  physical part, making the drop-point immune to FOV borders and debris.
+- Radial Feature Boosting: Internal features (holes) are weighted 5x to
+  prevent symmetric perimeters (gear teeth) from dominating the rotation.
+- CuPy Acceleration: Fused C++ kernels evaluate the grid sweep and
+  Powell iterations entirely in VRAM for sub-second performance.
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
-from scipy.ndimage import map_coordinates, gaussian_filter
+import cupy as cp
 from scipy.optimize import minimize
 
 from app.models.fit_result import FitResult
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CUDA Kernels
+# ─────────────────────────────────────────────────────────────────────────────
+
+_fused_kernels_src = r'''
+extern "C" __global__
+void fused_sweep_kernel(
+    const float* dist, const float* dxf_x, const float* dxf_y, const float* pt_weights,
+    const float* angles, const float* gx, const float* gy,
+    float* out_costs,
+    int width, int height, int num_pts,
+    float dxf_cx, float dxf_cy, float tx_init, float ty_init,
+    float delta, float oob_dist,
+    int num_gx, int num_gy, int num_angles)
+{
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    int ia = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (ix >= num_gx || iy >= num_gy || ia >= num_angles) return;
+
+    float tx = tx_init + gx[ix];
+    float ty = ty_init + gy[iy];
+    float theta = angles[ia];
+
+    float cos_t = cosf(theta);
+    float sin_t = sinf(theta);
+    float total_cost = 0.0f;
+
+    for (int p = 0; p < num_pts; ++p) {
+        float px = dxf_x[p];
+        float py = dxf_y[p];
+
+        float nx = cos_t * px - sin_t * py + dxf_cx + tx;
+        float ny = sin_t * px + cos_t * py + dxf_cy + ty;
+
+        float val = oob_dist;
+        if (nx >= 0.0f && nx < (width - 1.0f) && ny >= 0.0f && ny < (height - 1.0f)) {
+            int x0 = (int)nx;
+            int y0 = (int)ny;
+            float dx = nx - x0;
+            float dy = ny - y0;
+
+            float v00 = dist[y0 * width + x0];
+            float v10 = dist[y0 * width + x0 + 1];
+            float v01 = dist[(y0 + 1) * width + x0];
+            float v11 = dist[(y0 + 1) * width + x0 + 1];
+
+            float v0 = v00 + dx * (v10 - v00);
+            float v1 = v01 + dx * (v11 - v01);
+            val = v0 + dy * (v1 - v0);
+        }
+        
+        float w = pt_weights[p];
+        float v_d = val / delta;
+        total_cost += w * (1.0f - expf(-0.5f * v_d * v_d));
+    }
+    int out_idx = (iy * num_gx + ix) * num_angles + ia;
+    out_costs[out_idx] = total_cost / (float)num_pts;
+}
+
+extern "C" __global__
+void point_cost_huber(
+    const float* dist, const float* dxf_x, const float* dxf_y, const float* pt_weights,
+    float* out_total_cost,
+    int width, int height, int num_pts,
+    float dxf_cx, float dxf_cy, float tx, float ty, float theta,
+    float delta, float weight, float oob_dist)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= num_pts) return;
+
+    float cos_t = cosf(theta);
+    float sin_t = sinf(theta);
+    float px = dxf_x[p], py = dxf_y[p];
+
+    float nx = cos_t * px - sin_t * py + dxf_cx + tx;
+    float ny = sin_t * px + cos_t * py + dxf_cy + ty;
+
+    float val = oob_dist;
+    if (nx >= 0.0f && nx < (width - 1.0f) && ny >= 0.0f && ny < (height - 1.0f)) {
+        int x0 = (int)nx, y0 = (int)ny;
+        float dx = nx - x0, dy = ny - y0;
+        float v00 = dist[y0 * width + x0], v10 = dist[y0 * width + x0 + 1];
+        float v01 = dist[(y0 + 1) * width + x0], v11 = dist[(y0 + 1) * width + x0 + 1];
+        val = (v00 + dx*(v10-v00)) + dy*((v01 + dx*(v11-v01)) - (v00 + dx*(v10-v00)));
+    }
+
+    float w = pt_weights[p];
+    float v_d = val / delta;
+    atomicAdd(out_total_cost, w * weight * delta * delta * (sqrtf(1.0f + v_d * v_d) - 1.0f));
+}
+
+extern "C" __global__
+void point_cost_welsch(
+    const float* dist, const float* dxf_x, const float* dxf_y, const float* pt_weights,
+    float* out_total_cost,
+    int width, int height, int num_pts,
+    float dxf_cx, float dxf_cy, float tx, float ty, float theta,
+    float delta, float weight, float oob_dist)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= num_pts) return;
+
+    float cos_t = cosf(theta);
+    float sin_t = sinf(theta);
+    float px = dxf_x[p], py = dxf_y[p];
+
+    float nx = cos_t * px - sin_t * py + dxf_cx + tx;
+    float ny = sin_t * px + cos_t * py + dxf_cy + ty;
+
+    float val = oob_dist;
+    if (nx >= 0.0f && nx < (width - 1.0f) && ny >= 0.0f && ny < (height - 1.0f)) {
+        int x0 = (int)nx, y0 = (int)ny;
+        float dx = nx - x0, dy = ny - y0;
+        float v00 = dist[y0 * width + x0], v10 = dist[y0 * width + x0 + 1];
+        float v01 = dist[(y0 + 1) * width + x0], v11 = dist[(y0 + 1) * width + x0 + 1];
+        val = (v00 + dx*(v10-v00)) + dy*((v01 + dx*(v11-v01)) - (v00 + dx*(v10-v00)));
+    }
+
+    float w = pt_weights[p];
+    float v_d = val / delta;
+    atomicAdd(out_total_cost, w * (1.0f - expf(-0.5f * v_d * v_d)));
+}
+'''
+
+_k_fused_sweep = cp.RawKernel(_fused_kernels_src, 'fused_sweep_kernel', options=('-use_fast_math',))
+_k_point_cost_huber = cp.RawKernel(_fused_kernels_src, 'point_cost_huber', options=('-use_fast_math',))
+_k_point_cost_welsch = cp.RawKernel(_fused_kernels_src, 'point_cost_welsch', options=('-use_fast_math',))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _make_cost_fn(
-        dxf_c: np.ndarray,
+        dxf_c_cp: cp.ndarray,
+        pt_weights_cp: cp.ndarray,
         dxf_cx: float,
         dxf_cy: float,
-        dist_t: np.ndarray,
-        loss_type: str = "Huber",  # "Huber" (pulls globally) or "Welsch" (ignores texture)
-        objective: str = "Tolerance",
+        dist_t_cp: cp.ndarray,
+        loss_type: str = "Huber",
         max_error_px: float = 1.0,
         locked_theta: float | None = None,
-        interp_order: int = 1,
 ) -> callable:
-    H, W = dist_t.shape
+    H, W = dist_t_cp.shape
     _OOB_DIST = float(max(H, W))
+    delta_c = float(max(0.5, max_error_px))
+    weight_c = 0.5
 
-    def _sample_dist(nx, ny):
-        in_b = (nx >= 0) & (nx < W - 1) & (ny >= 0) & (ny < H - 1)
-        out = np.full(len(nx), _OOB_DIST, dtype=np.float64)
-        if in_b.sum() >= 10:
-            out[in_b] = map_coordinates(
-                dist_t, [ny[in_b], nx[in_b]],
-                order=interp_order, mode="nearest", prefilter=False
-            )
-        return out, in_b
+    dxf_x_cp = cp.ascontiguousarray(dxf_c_cp[:, 0], dtype=cp.float32)
+    dxf_y_cp = cp.ascontiguousarray(dxf_c_cp[:, 1], dtype=cp.float32)
+    num_pts = len(dxf_x_cp)
+    out_total_cp = cp.zeros(1, dtype=cp.float32)
 
-    def _transform(tx, ty, theta):
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
-        nx = cos_t * dxf_c[:, 0] - sin_t * dxf_c[:, 1] + dxf_cx + tx
-        ny = sin_t * dxf_c[:, 0] + cos_t * dxf_c[:, 1] + dxf_cy + ty
-        return nx, ny
+    block = (256,)
+    grid = ((num_pts + 255) // 256,)
+    kernel = _k_point_cost_welsch if loss_type == "Welsch" else _k_point_cost_huber
 
-    def _calc_huber_cost(vals):
-        """Pulls from anywhere in the image. Great for initial sweeps."""
-        delta = max(0.5, max_error_px)
-        weight = 0.5 if objective == "Tolerance" else 1.0
-        return float(np.mean(weight * delta**2 * (np.sqrt(1 + (vals / delta)**2) - 1)))
-
-    def _calc_welsch_cost(vals):
-        """
-        Redescending Robust Loss.
-        As 'vals' exceeds max_error_px, the penalty caps out at 1.0 and the gradient
-        drops to 0. This makes distant texture completely invisible to the optimizer.
-        """
-        delta = max(0.5, max_error_px)
-        # 1.0 - exp(...) maps distance 0 -> 0, and distance infinity -> 1.0
-        return float(np.mean(1.0 - np.exp(-0.5 * (vals / delta)**2)))
-
-    _loss_func = _calc_welsch_cost if loss_type == "Welsch" else _calc_huber_cost
-
-    if locked_theta is not None:
-        theta_fixed = float(locked_theta)
-        cos_l = np.cos(theta_fixed)
-        sin_l = np.sin(theta_fixed)
-        nx_base = cos_l * dxf_c[:, 0] - sin_l * dxf_c[:, 1] + dxf_cx
-        ny_base = sin_l * dxf_c[:, 0] + cos_l * dxf_c[:, 1] + dxf_cy
-
-        def cost_fn(params):
-            tx, ty = float(params[0]), float(params[1])
-            nx, ny = nx_base + tx, ny_base + ty
-            vals, in_b = _sample_dist(nx, ny)
-            if in_b.sum() < 10:
-                return _OOB_DIST
-            return _loss_func(vals)
-
-    else:
-        def cost_fn(params):
-            tx, ty, theta = float(params[0]), float(params[1]), float(params[2])
-            nx, ny = _transform(tx, ty, theta)
-            vals, in_b = _sample_dist(nx, ny)
-            if in_b.sum() < 10:
-                return _OOB_DIST
-            return _loss_func(vals)
+    def cost_fn(params):
+        out_total_cp.fill(0.0)
+        tx, ty = float(params[0]), float(params[1])
+        theta = float(locked_theta if locked_theta is not None else params[2])
+        kernel(grid, block, (
+            dist_t_cp, dxf_x_cp, dxf_y_cp, pt_weights_cp, out_total_cp,
+            W, H, num_pts,
+            cp.float32(dxf_cx), cp.float32(dxf_cy), cp.float32(tx), cp.float32(ty), cp.float32(theta),
+            cp.float32(delta_c), cp.float32(weight_c), cp.float32(_OOB_DIST)
+        ))
+        return float(out_total_cp[0]) / num_pts
 
     return cost_fn
 
@@ -97,25 +200,19 @@ def _make_cost_fn(
 def _sample_polylines(polylines: list[np.ndarray], spacing: float = 0.5) -> np.ndarray:
     pts = []
     for poly in polylines:
-        if len(poly) < 2:
-            continue
+        if len(poly) < 2: continue
         for i in range(len(poly) - 1):
-            p0 = poly[i].astype(np.float64)
-            p1 = poly[i + 1].astype(np.float64)
+            p0, p1 = poly[i].astype(np.float64), poly[i + 1].astype(np.float64)
             seg_len = np.hypot(p1[0] - p0[0], p1[1] - p0[1])
             n = max(2, int(np.ceil(seg_len / spacing)))
             t = np.linspace(0.0, 1.0, n, endpoint=False)
             pts.append(p0 + np.outer(t, p1 - p0))
-    if not pts:
-        return np.empty((0, 2), dtype=np.float32)
-    return np.vstack(pts).astype(np.float32)
+    return np.vstack(pts).astype(np.float32) if pts else np.empty((0, 2), dtype=np.float32)
 
 
 def _stride_subsample(pts: np.ndarray, n: int) -> np.ndarray:
-    if len(pts) <= n:
-        return pts
-    idx = np.linspace(0, len(pts) - 1, n, dtype=np.int32)
-    return pts[idx]
+    if len(pts) <= n: return pts
+    return pts[np.linspace(0, len(pts) - 1, n, dtype=np.int32)]
 
 
 def fit(
@@ -126,388 +223,153 @@ def fit(
         objective: str = "Tolerance",
         max_error_px: float = 1.0,
 ) -> FitResult:
-    if distance_field is None:
-        raise ValueError("distance_field is required for fitting.")
+    if distance_field is None: raise ValueError("distance_field required.")
 
     H, W = distance_field.shape
+    diag = np.hypot(H, W)
 
-    # ── Step 1: Micro-Smooth Only ─────────────────────────────────────
-    # Do NOT blur heavily. We only use a tiny blur to fix pixel-grid aliasing.
-    dist_smooth = gaussian_filter(distance_field.astype(np.float32), sigma=0.5)
+    # ── Step 1: Adaptive CPU Smoothing ────────────────────────────────
+    # Blur radius scales with resolution (0.05% of diagonal)
+    sigma_val = max(0.5, diag * 0.0005)
+    dist_smooth = cv2.GaussianBlur(distance_field.astype(np.float32), (0, 0), sigma_val)
+    dist_smooth_cp = cp.ascontiguousarray(cp.asarray(dist_smooth), dtype=cp.float32)
 
     # ── Step 2: DXF samples ───────────────────────────────────────────
     dxf_all = _sample_polylines(polylines, spacing=0.5)
-    if len(dxf_all) == 0:
-        raise ValueError("DXF polylines produced no sample points.")
+    dxf_sweep = _stride_subsample(dxf_all, n=800)
+    dxf_sample = _stride_subsample(dxf_all, n=3000)
 
-    dxf_sweep  = _stride_subsample(dxf_all, n=600)
-    dxf_sample = _stride_subsample(dxf_all, n=4000)
+    # ── Step 3: Blob-Locked Centroids (Resolution Independent) ────────
+    dxf_min_x, dxf_max_x = float(dxf_all[:, 0].min()), float(dxf_all[:, 0].max())
+    dxf_min_y, dxf_max_y = float(dxf_all[:, 1].min()), float(dxf_all[:, 1].max())
+    dxf_cx, dxf_cy = (dxf_min_x + dxf_max_x) / 2.0, (dxf_min_y + dxf_max_y) / 2.0
 
-    # ── Step 3: Centroids ─────────────────────────────────────────────
-    dxf_cx = float(dxf_all[:, 0].mean())
-    dxf_cy = float(dxf_all[:, 1].mean())
+    scene_cx, scene_cy = W / 2.0, H / 2.0
+    # Threshold distance field to create a "fat" mask (2% of diagonal)
+    blob_thresh = diag * 0.02
+    thick_edges = (distance_field < blob_thresh).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thick_edges, connectivity=8)
 
-    if silhouette_mask is not None and silhouette_mask.any():
-        M_scene = cv2.moments(silhouette_mask)
-        scene_cx = float(M_scene["m10"] / max(M_scene["m00"], 1))
-        scene_cy = float(M_scene["m01"] / max(M_scene["m00"], 1))
-    elif edge_points is not None and len(edge_points) > 0:
-        scene_cx = float(np.median(edge_points[:, 0]))
-        scene_cy = float(np.median(edge_points[:, 1]))
-    else:
-        scene_cx, scene_cy = W / 2.0, H / 2.0
+    if num_labels > 1:
+        largest_idx = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
+        scene_cx = stats[largest_idx, cv2.CC_STAT_LEFT] + stats[largest_idx, cv2.CC_STAT_WIDTH] / 2.0
+        scene_cy = stats[largest_idx, cv2.CC_STAT_TOP] + stats[largest_idx, cv2.CC_STAT_HEIGHT] / 2.0
 
-    tx_init = scene_cx - dxf_cx
-    ty_init = scene_cy - dxf_cy
+    tx_init, ty_init = scene_cx - dxf_cx, scene_cy - dxf_cy
 
-    # ── Step 4: Centred coordinate arrays & Cost Functions ────────────
+    # ── Step 4: Radial Weighting ──────────────────────────────────────
     centroid = np.array([dxf_cx, dxf_cy], dtype=np.float32)
-    dxf_c_sweep = (dxf_sweep  - centroid).astype(np.float64)
-    dxf_c       = (dxf_sample - centroid).astype(np.float64)
+    dxf_sample_c = dxf_sample - centroid
+    dxf_c_cp = cp.asarray(dxf_sample_c, dtype=cp.float32)
 
-    # SWEEP/PULL: Huber loss (to pull from far away)
-    cost_pull = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_smooth,
-                              loss_type="Huber", objective=objective,
-                              max_error_px=max_error_px, interp_order=1)
+    radii = np.hypot(dxf_sample_c[:, 0], dxf_sample_c[:, 1])
+    r_max = radii.max() if len(radii) > 0 else 1.0
+    pt_weights = np.ones(len(dxf_sample), dtype=np.float32)
+    pt_weights[radii < r_max * 0.92] = 5.0  # Holes weighted 5x
+    pt_weights_cp = cp.asarray(pt_weights, dtype=cp.float32)
 
-    # POLISH: Welsch loss + Bicubic (ignores texture entirely, snaps to edge)
-    cost_polish = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_smooth,
-                                loss_type="Welsch", objective=objective,
-                                max_error_px=max_error_px, interp_order=3)
+    cost_pull = _make_cost_fn(dxf_c_cp, pt_weights_cp, dxf_cx, dxf_cy, dist_smooth_cp, "Huber", max_error_px)
+    cost_polish = _make_cost_fn(dxf_c_cp, pt_weights_cp, dxf_cx, dxf_cy, dist_smooth_cp, "Welsch", max_error_px)
 
-    # ── Step 5: Fully-vectorised coarse X/Y grid + angle sweep ────────
-    angles = np.linspace(-np.pi, np.pi, 180, endpoint=False)
-    grid_offsets = np.linspace(-24.0, 24.0, 9)
+    # ── Step 5: Resolution-Independent Fused Sweep ────────────────────
+    num_angles, num_gx, num_gy = 360, 21, 21
+    angles_cp = cp.linspace(-cp.pi, cp.pi, num_angles, endpoint=False, dtype=cp.float32)
+    # Search range is 5% of image diagonal
+    search_range = diag * 0.05
+    gx_cp = cp.linspace(-search_range, search_range, num_gx, dtype=cp.float32)
+    gy_cp = cp.linspace(-search_range, search_range, num_gy, dtype=cp.float32)
 
-    _OOB_D   = float(max(H, W))
-    delta_c  = max(0.5, max_error_px * 5.0)
-    weight_c = 0.5 if objective == "Tolerance" else 1.0
-    n_angles = len(angles)
-    n_sweep  = len(dxf_c_sweep)
+    dxf_sweep_c = dxf_sweep - centroid
+    dxf_x_cp = cp.ascontiguousarray(cp.asarray(dxf_sweep_c[:, 0]), dtype=cp.float32)
+    dxf_y_cp = cp.ascontiguousarray(cp.asarray(dxf_sweep_c[:, 1]), dtype=cp.float32)
 
-    cos_a  = np.cos(angles)
-    sin_a  = np.sin(angles)
-    nx_rot = cos_a[:, None] * dxf_c_sweep[:, 0] - sin_a[:, None] * dxf_c_sweep[:, 1]
-    ny_rot = sin_a[:, None] * dxf_c_sweep[:, 0] + cos_a[:, None] * dxf_c_sweep[:, 1]
+    sweep_radii = np.hypot(dxf_sweep_c[:, 0], dxf_sweep_c[:, 1])
+    sweep_weights = np.ones(len(dxf_sweep), dtype=np.float32)
+    sweep_weights[sweep_radii < (sweep_radii.max() * 0.92)] = 5.0
+    sweep_weights_cp = cp.asarray(sweep_weights, dtype=cp.float32)
 
-    all_costs = np.full((len(grid_offsets), len(grid_offsets), n_angles), _OOB_D)
+    costs_cp = cp.empty((num_gy, num_gx, num_angles), dtype=cp.float32)
+    sweep_delta = max(10.0, diag * 0.01)
 
-    for i, dx in enumerate(grid_offsets):
-        for j, dy in enumerate(grid_offsets):
-            tx = tx_init + dx
-            ty = ty_init + dy
-            nx = nx_rot + (dxf_cx + tx)
-            ny = ny_rot + (dxf_cy + ty)
-            nx_f = nx.ravel()
-            ny_f = ny.ravel()
-            in_b = (nx_f >= 0) & (nx_f < W - 1) & (ny_f >= 0) & (ny_f < H - 1)
-            vals_f = np.full(len(nx_f), _OOB_D, dtype=np.float64)
-            if in_b.any():
-                vals_f[in_b] = map_coordinates(
-                    dist_smooth, [ny_f[in_b], nx_f[in_b]],
-                    order=1, mode="nearest", prefilter=False,
-                )
-            vals = vals_f.reshape(n_angles, n_sweep)
+    _k_fused_sweep((num_gx//8+1, num_gy//8+1, num_angles//4+1), (8, 8, 4),
+        (dist_smooth_cp, dxf_x_cp, dxf_y_cp, sweep_weights_cp, angles_cp, gx_cp, gy_cp, costs_cp,
+         W, H, len(dxf_x_cp), cp.float32(dxf_cx), cp.float32(dxf_cy), cp.float32(tx_init), cp.float32(ty_init),
+         cp.float32(sweep_delta), cp.float32(diag), num_gx, num_gy, num_angles))
 
-            # Vectorized Huber calculation for the sweep
-            all_costs[i, j] = np.mean(
-                weight_c * delta_c ** 2 * (np.sqrt(1.0 + (vals / delta_c) ** 2) - 1.0),
-                axis=1,
-            )
-
-    flat     = all_costs.ravel()
-    top_flat = np.argpartition(flat, min(5, len(flat) - 1))[:5]
-    top_flat = top_flat[np.argsort(flat[top_flat])]
-    top_candidates = []
-    for flat_i in top_flat:
-        gi, gj, ak = np.unravel_index(int(flat_i), all_costs.shape)
-        top_candidates.append(
-            [tx_init + grid_offsets[gi], ty_init + grid_offsets[gj], angles[ak]]
-        )
+    flat_idx = int(cp.argmin(costs_cp))
+    iy, ix, ia = np.unravel_index(flat_idx, (num_gy, num_gx, num_angles))
+    best_candidate = [tx_init + float(gx_cp[ix]), ty_init + float(gy_cp[iy]), float(angles_cp[ia])]
 
     # ── Step 6: Powell Refinement ─────────────────────────────────────
-    best_res = None
-
-    # Stage A: Loose pass on top-5 using Huber (pulls out of local ruts)
-    for candidate in top_candidates:
-        res = minimize(
-            cost_pull,
-            np.array(candidate, dtype=np.float64),
-            method="Powell",
-            options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 25},
-        )
-        if best_res is None or res.fun < best_res.fun:
-            best_res = res
-
-    # Stage B: Strict tightening on winner using Welsch.
-    # This zeroes out the texture gradient and snaps to the true edge.
-    final_res = minimize(
-        cost_polish,
-        best_res.x,
-        method="Powell",
-        options={"xtol": 1e-5, "ftol": 1e-6, "maxiter": 150},
-    )
+    res_pull = minimize(cost_pull, np.array(best_candidate), method="Powell", options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 20})
+    final_res = minimize(cost_polish, res_pull.x, method="Powell", options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 75})
 
     tx_opt, ty_opt, angle_opt = final_res.x
+    inlier_frac = _compute_inlier_frac(polylines, final_res.x, dist_smooth_cp, dxf_cx, dxf_cy, max_error_px)
 
-    # ── Step 7: Inlier fraction ───────────────────────────────────────
-    inlier_frac = _compute_inlier_frac(
-        polylines, final_res.x, dist_smooth, dxf_cx, dxf_cy, max_error_px
-    )
-
-    return FitResult(
-        tx=float(tx_opt),
-        ty=float(ty_opt),
-        angle_deg=float(np.degrees(angle_opt)),
-        cost=float(final_res.fun),
-        dxf_cx=dxf_cx,
-        dxf_cy=dxf_cy,
-        inlier_frac=inlier_frac,
-        dist_t=dist_smooth,
-        dist_raw=distance_field.astype(np.float32),
-    )
+    return FitResult(tx=float(tx_opt), ty=float(ty_opt), angle_deg=float(np.degrees(angle_opt)), cost=float(final_res.fun),
+                     dxf_cx=dxf_cx, dxf_cy=dxf_cy, inlier_frac=inlier_frac, dist_t=cp.asnumpy(dist_smooth_cp),
+                     dist_raw=distance_field.astype(np.float32))
 
 
-# ======================================================================
-# Refine / Sub-functions
-# ======================================================================
+def _compute_inlier_frac(polylines: list[np.ndarray], params: np.ndarray, dist_t_cp: cp.ndarray, dxf_cx: float, dxf_cy: float, max_error_px: float) -> float:
+    all_pts = _sample_polylines(polylines, spacing=1.0)
+    if len(all_pts) == 0: return 0.0
+    all_c_cp = cp.asarray(all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32), dtype=cp.float32)
+    tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
+    cos_t, sin_t = float(np.cos(angle)), float(np.sin(angle))
+    nx_cp, ny_cp = cos_t * all_c_cp[:, 0] - sin_t * all_c_cp[:, 1] + dxf_cx + tx, sin_t * all_c_cp[:, 0] + cos_t * all_c_cp[:, 1] + dxf_cy + ty
+    from cupyx.scipy.ndimage import map_coordinates as cp_map_coordinates
+    vals = cp_map_coordinates(dist_t_cp, cp.stack([ny_cp, nx_cp]), order=1, mode="constant", cval=float(max(dist_t_cp.shape)), prefilter=False)
+    return float(cp.mean(vals < max_error_px))
 
-def _refine_from(
-        polylines: list[np.ndarray],
-        init_params: np.ndarray,
-        dist_t: np.ndarray,
-        n_sample: int = 4000,
-        maxiter: int = 300,
-        objective: str = "Tolerance",
-        max_error_px: float = 1.0,
-        dxf_cx: float | None = None,
-        dxf_cy: float | None = None,
-) -> tuple:
-    H, W = dist_t.shape
+
+def fit_complete(polylines_all: list[np.ndarray], polylines_refine: list[np.ndarray], edge_points: np.ndarray, silhouette_mask: np.ndarray | None = None, distance_field: np.ndarray | None = None, polylines_rot: list[np.ndarray] | None = None, polylines_pan: list[np.ndarray] | None = None, objective: str = "Tolerance", max_error_px: float = 1.0) -> FitResult:
+    res = fit(polylines_all, edge_points, silhouette_mask, distance_field, objective, max_error_px)
+    dist_t_cp = cp.ascontiguousarray(cp.asarray(res.dist_t), dtype=cp.float32)
+    params = np.array([res.tx, res.ty, np.radians(res.angle_deg)])
+
+    if polylines_refine:
+        res_ref, _, _, _ = _refine_from(polylines_refine, params, dist_t_cp, n_sample=3000, max_error_px=max_error_px, dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy)
+        params = res_ref
+
+    inlier = _compute_inlier_frac(polylines_all, params, dist_t_cp, res.dxf_cx, res.dxf_cy, max_error_px)
+    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost, dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)
+
+
+def _refine_from(polylines, init_params, dist_t_cp, n_sample=3000, max_error_px=1.0, dxf_cx=None, dxf_cy=None) -> tuple:
     dxf_all = _sample_polylines(polylines, spacing=0.5)
-    if len(dxf_all) == 0:
-        raise ValueError("Polylines produced no sample points.")
-
     dxf_sample = _stride_subsample(dxf_all, n=n_sample)
+    if dxf_cx is None: dxf_cx, dxf_cy = dxf_all[:, 0].mean(), dxf_all[:, 1].mean()
 
-    if dxf_cx is None or dxf_cy is None:
-        dxf_cx = float(dxf_all[:, 0].mean())
-        dxf_cy = float(dxf_all[:, 1].mean())
+    centroid = np.array([dxf_cx, dxf_cy], dtype=np.float32)
+    dxf_c_cp = cp.asarray(dxf_sample - centroid, dtype=cp.float32)
 
-    dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
+    radii = np.hypot(dxf_sample[:, 0] - dxf_cx, dxf_sample[:, 1] - dxf_cy)
+    pt_weights = np.ones(len(dxf_sample), dtype=np.float32)
+    pt_weights[radii < radii.max() * 0.92] = 5.0
+    pt_weights_cp = cp.asarray(pt_weights, dtype=cp.float32)
 
-    # Downstream refinements are strictly metrology polish. Use Welsch.
-    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t, loss_type="Welsch",
-                            objective=objective, max_error_px=max_error_px, interp_order=3)
-
-    res = minimize(
-        cost_fn,
-        init_params.astype(np.float64),
-        method="Powell",
-        options={"xtol": 1e-5, "ftol": 1e-6, "maxiter": maxiter},
-    )
+    cost_fn = _make_cost_fn(dxf_c_cp, pt_weights_cp, dxf_cx, dxf_cy, dist_t_cp, "Welsch", max_error_px)
+    res = minimize(cost_fn, init_params, method="Powell", options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 100})
     return res.x, res.fun, dxf_cx, dxf_cy
 
 
-def _refine_translation_only(
-        polylines: list[np.ndarray],
-        init_params: np.ndarray,
-        dist_t: np.ndarray,
-        n_sample: int = 4000,
-        maxiter: int = 300,
-        objective: str = "Tolerance",
-        max_error_px: float = 1.0,
-        dxf_cx: float | None = None,
-        dxf_cy: float | None = None,
-) -> tuple:
-    H, W = dist_t.shape
-    dxf_all = _sample_polylines(polylines, spacing=0.5)
-    if len(dxf_all) == 0:
-        raise ValueError("Polylines produced no sample points.")
-
-    dxf_sample = _stride_subsample(dxf_all, n=n_sample)
-
-    if dxf_cx is None or dxf_cy is None:
-        dxf_cx = float(dxf_all[:, 0].mean())
-        dxf_cy = float(dxf_all[:, 1].mean())
-
-    dxf_c = (dxf_sample - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
-    theta_locked = float(init_params[2])
-
-    cost_fn = _make_cost_fn(dxf_c, dxf_cx, dxf_cy, dist_t, loss_type="Welsch",
-                            objective=objective, max_error_px=max_error_px,
-                            locked_theta=theta_locked, interp_order=3)
-
-    res = minimize(
-        cost_fn,
-        np.array([init_params[0], init_params[1]], dtype=np.float64),
-        method="Powell",
-        options={"xtol": 1e-5, "ftol": 1e-6, "maxiter": maxiter},
-    )
-    out_params = np.array([res.x[0], res.x[1], theta_locked])
-    return out_params, res.fun, dxf_cx, dxf_cy
-
-
-def _compute_inlier_frac(
-        polylines: list[np.ndarray],
-        params: np.ndarray,
-        dist_t: np.ndarray,
-        dxf_cx: float,
-        dxf_cy: float,
-        max_error_px: float = 1.0,
-) -> float:
-    H, W = dist_t.shape
-    all_pts = _sample_polylines(polylines, spacing=1.0)
-    if len(all_pts) == 0:
-        return 0.0
-
-    all_c = (all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32)).astype(np.float64)
-    tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
-    cos_t, sin_t = np.cos(angle), np.sin(angle)
-    nx_all = cos_t * all_c[:, 0] - sin_t * all_c[:, 1] + dxf_cx + tx
-    ny_all = sin_t * all_c[:, 0] + cos_t * all_c[:, 1] + dxf_cy + ty
-    valid = (nx_all >= 0) & (nx_all < W - 1) & (ny_all >= 0) & (ny_all < H - 1)
-
-    if valid.sum() > 0:
-        vals = map_coordinates(dist_t, [ny_all[valid], nx_all[valid]],
-                               order=1, mode="nearest", prefilter=False)
-        return float(np.mean(vals < max_error_px))
-    return 0.0
-
-
-def fit_complete(
-        polylines_all: list[np.ndarray],
-        polylines_refine: list[np.ndarray],
-        edge_points: np.ndarray,
-        silhouette_mask: np.ndarray | None = None,
-        distance_field: np.ndarray | None = None,
-        polylines_rot: list[np.ndarray] | None = None,
-        polylines_pan: list[np.ndarray] | None = None,
-        objective: str = "Tolerance",
-        max_error_px: float = 1.0,
-) -> FitResult:
-    if distance_field is None:
-        raise ValueError("distance_field is required for fitting.")
-
-    effective_refine = polylines_refine
-    if not effective_refine:
-        effective_refine = (polylines_rot or []) + (polylines_pan or [])
-        if effective_refine:
-            print("Refine mode: no REFINE layer found — using ROT + PAN as fallback.")
-
-    result_coarse = fit(
-        polylines=polylines_all,
-        edge_points=edge_points,
-        silhouette_mask=silhouette_mask,
-        distance_field=distance_field,
-        objective=objective,
-        max_error_px=max_error_px,
-    )
-    dist_t = result_coarse.dist_t
-    angle_rad = np.radians(result_coarse.angle_deg)
-    params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
-
-    global_cx, global_cy = result_coarse.dxf_cx, result_coarse.dxf_cy
-
-    params_2, cost_2, _, _ = _refine_from(
-        polylines_all, params_1, dist_t, n_sample=4000,
-        objective=objective, max_error_px=max_error_px,
-        dxf_cx=global_cx, dxf_cy=global_cy
-    )
-
-    if effective_refine:
-        params_3, cost_3, _, _ = _refine_from(
-            effective_refine, params_2, dist_t, n_sample=4000,
-            objective=objective, max_error_px=max_error_px,
-            dxf_cx=global_cx, dxf_cy=global_cy
-        )
-    else:
-        params_3, cost_3 = params_2, cost_2
-
-    inlier_frac = _compute_inlier_frac(
-        polylines_all, params_3, dist_t,
-        dxf_cx=global_cx, dxf_cy=global_cy,
-        max_error_px=max_error_px
-    )
-
-    return FitResult(
-        tx=float(params_3[0]),
-        ty=float(params_3[1]),
-        angle_deg=float(np.degrees(params_3[2])),
-        cost=float(cost_3),
-        dxf_cx=global_cx,
-        dxf_cy=global_cy,
-        inlier_frac=inlier_frac,
-        dist_t=dist_t,
-        dist_raw=result_coarse.dist_raw,
-    )
-
-
-def fit_poc(
-        polylines_all: list[np.ndarray],
-        polylines_rot: list[np.ndarray],
-        polylines_pan: list[np.ndarray],
-        edge_points: np.ndarray,
-        silhouette_mask: np.ndarray | None = None,
-        distance_field: np.ndarray | None = None,
-        objective: str = "Tolerance",
-        max_error_px: float = 1.0,
-) -> FitResult:
-    if distance_field is None:
-        raise ValueError("distance_field is required for fitting.")
-
-    result_coarse = fit(
-        polylines=polylines_all,
-        edge_points=edge_points,
-        silhouette_mask=silhouette_mask,
-        distance_field=distance_field,
-        objective=objective,
-        max_error_px=max_error_px,
-    )
-    dist_t = result_coarse.dist_t
-    angle_rad = np.radians(result_coarse.angle_deg)
-    params_1 = np.array([result_coarse.tx, result_coarse.ty, angle_rad])
-
-    global_cx, global_cy = result_coarse.dxf_cx, result_coarse.dxf_cy
-
-    params_2, cost_2, _, _ = _refine_from(
-        polylines_all, params_1, dist_t, n_sample=4000,
-        objective=objective, max_error_px=max_error_px,
-        dxf_cx=global_cx, dxf_cy=global_cy
-    )
+def fit_poc(polylines_all, polylines_rot, polylines_pan, edge_points, silhouette_mask=None, distance_field=None, objective="Tolerance", max_error_px=1.0) -> FitResult:
+    res = fit(polylines_all, edge_points, silhouette_mask, distance_field, objective, max_error_px)
+    dist_t_cp = cp.ascontiguousarray(cp.asarray(res.dist_t), dtype=cp.float32)
+    params = np.array([res.tx, res.ty, np.radians(res.angle_deg)])
 
     if polylines_rot:
-        params_3, cost_3, _, _ = _refine_from(
-            polylines_rot, params_2, dist_t, n_sample=4000,
-            objective=objective, max_error_px=max_error_px,
-            dxf_cx=global_cx, dxf_cy=global_cy
-        )
-    else:
-        params_3, cost_3 = params_2, cost_2
-
+        params, _, _, _ = _refine_from(polylines_rot, params, dist_t_cp, 3000, max_error_px, res.dxf_cx, res.dxf_cy)
     if polylines_pan:
-        params_4, cost_4, _, _ = _refine_translation_only(
-            polylines_pan, params_3, dist_t, n_sample=4000,
-            objective=objective, max_error_px=max_error_px,
-            dxf_cx=global_cx, dxf_cy=global_cy
-        )
-    else:
-        params_4, cost_4 = params_3, cost_3
+        dxf_all = _sample_polylines(polylines_pan, 0.5)
+        dxf_sample = _stride_subsample(dxf_all, 3000)
+        dxf_c_cp = cp.asarray(dxf_sample - np.array([res.dxf_cx, res.dxf_cy], dtype=np.float32), dtype=cp.float32)
+        pt_w_cp = cp.ones(len(dxf_sample), dtype=cp.float32)
+        cost_fn = _make_cost_fn(dxf_c_cp, pt_w_cp, res.dxf_cx, res.dxf_cy, dist_t_cp, "Welsch", max_error_px, locked_theta=params[2])
+        res_pan = minimize(cost_fn, params[:2], method="Powell", options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 100})
+        params[:2] = res_pan.x
 
-    inlier_frac = _compute_inlier_frac(
-        polylines_all, params_4, dist_t,
-        dxf_cx=global_cx, dxf_cy=global_cy,
-        max_error_px=max_error_px
-    )
-
-    return FitResult(
-        tx=float(params_4[0]),
-        ty=float(params_4[1]),
-        angle_deg=float(np.degrees(params_4[2])),
-        cost=float(cost_4),
-        dxf_cx=global_cx,
-        dxf_cy=global_cy,
-        inlier_frac=inlier_frac,
-        dist_t=dist_t,
-        dist_raw=result_coarse.dist_raw,
-    )
+    inlier = _compute_inlier_frac(polylines_all, params, dist_t_cp, res.dxf_cx, res.dxf_cy, max_error_px)
+    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost, dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)
