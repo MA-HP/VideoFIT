@@ -14,7 +14,7 @@ automatically resets to normal pan/zoom.
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QPointF, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import (
     QColor, QImage, QPainterPath, QPen, QPixmap,
 )
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 _STROKE_COLOR  = QColor(0, 210, 255)
 _STROKE_WIDTH  = 2        # cosmetic (screen) pixels
 _STROKE_DASH   = [6, 4]   # dash/gap pattern in screen pixels
+_STROKE_THROTTLE_SQ = 4.0 # skip stroke point if moved < 2 scene-px (squared)
 
 
 class ImageViewer(QGraphicsView):
@@ -60,11 +61,16 @@ class ImageViewer(QGraphicsView):
 
         self._current_cv_img: np.ndarray | None = None
 
+        # Cache last known frame resolution — avoids calling setSceneRect every frame
+        self._last_w: int = -1
+        self._last_h: int = -1
+
         # Stroke / brush state
         self._stroke_mode: bool = False
         self._stroke_pts: list[tuple[float, float]] = []
         self._stroke_path: QPainterPath = QPainterPath()
         self._stroke_item: QGraphicsPathItem | None = None
+        self._stroke_last_pt: tuple[float, float] | None = None  # throttle anchor
 
     # ── Public ────────────────────────────────────────────────────────
 
@@ -74,18 +80,31 @@ class ImageViewer(QGraphicsView):
         self._pixmap_item = QGraphicsPixmapItem()
         self._pixmap_item.setPos(-0.5, -0.5)   # keep pixel-centre alignment
         self._scene.addItem(self._pixmap_item)
+        self._last_w = -1
+        self._last_h = -1
 
     @Slot(object)
     def update_image(self, cv_img: np.ndarray) -> None:
         """Receive an RGB numpy array and display it."""
         self._current_cv_img = cv_img
         h, w, ch = cv_img.shape
+
+        # QImage needs a C-contiguous buffer; ensure it once here rather than
+        # letting Qt do an implicit copy internally on every frame.
+        if not cv_img.flags['C_CONTIGUOUS']:
+            cv_img = np.ascontiguousarray(cv_img)
+
         bytes_per_line = ch * w
         qimg = QImage(cv_img.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self._pixmap_item.setPixmap(QPixmap.fromImage(qimg))
-        # Scene rect in scene coordinates: pixel [row=y, col=x] centre sits at
-        # integer (x, y) because the pixmap is offset by -0.5 in both axes.
-        self._scene.setSceneRect(-0.5, -0.5, w, h)
+
+        # NoFormatConversion skips an extra pixel-format conversion pass inside Qt
+        self._pixmap_item.setPixmap(QPixmap.fromImage(qimg, Qt.NoFormatConversion))
+
+        # Only update the scene rect when the resolution actually changes
+        # (saves a full-scene bounding-rect recalculation on every frame)
+        if w != self._last_w or h != self._last_h:
+            self._scene.setSceneRect(-0.5, -0.5, w, h)
+            self._last_w, self._last_h = w, h
 
     def set_roi_mode(self, enabled: bool) -> None:
         """
@@ -113,7 +132,9 @@ class ImageViewer(QGraphicsView):
     def mousePressEvent(self, event) -> None:
         if self._stroke_mode and event.button() == Qt.LeftButton:
             pt = self.mapToScene(event.pos())
-            self._stroke_pts = [(pt.x(), pt.y())]
+            x, y = pt.x(), pt.y()
+            self._stroke_pts = [(x, y)]
+            self._stroke_last_pt = (x, y)
 
             self._stroke_path = QPainterPath()
             self._stroke_path.moveTo(pt)
@@ -129,8 +150,19 @@ class ImageViewer(QGraphicsView):
     def mouseMoveEvent(self, event) -> None:
         if self._stroke_mode and self._stroke_pts:
             pt = self.mapToScene(event.pos())
-            self._stroke_pts.append((pt.x(), pt.y()))
+            px, py = pt.x(), pt.y()
+
+            # Throttle: skip redraw if the cursor has barely moved (< 2 scene-px).
+            # This avoids pushing a new path segment + Qt repaint on every mouse
+            # event (which fires at ~125 Hz on many mice).
+            if self._stroke_last_pt is not None:
+                lx, ly = self._stroke_last_pt
+                if (px - lx) ** 2 + (py - ly) ** 2 < _STROKE_THROTTLE_SQ:
+                    return
+
+            self._stroke_pts.append((px, py))
             self._stroke_path.lineTo(pt)
+            self._stroke_last_pt = (px, py)
             if self._stroke_item is not None:
                 self._stroke_item.setPath(self._stroke_path)
         else:
@@ -152,4 +184,5 @@ class ImageViewer(QGraphicsView):
             self._scene.removeItem(self._stroke_item)
             self._stroke_item = None
         self._stroke_pts = []
+        self._stroke_last_pt = None
         self._stroke_path = QPainterPath()

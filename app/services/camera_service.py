@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import cv2
 import imagingcontrol4 as ic4
+import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 
@@ -22,16 +24,35 @@ class FrameSignaler(QObject):
 class _SinkListener(ic4.QueueSinkListener):
     """IC4 sink listener that converts incoming buffers to RGB and forwards them."""
 
+    # Cap the UI feed at 30 fps.  The camera may run faster (e.g. 60/120 fps)
+    # but there is no benefit sending more frames than the display can show —
+    # it only wastes CPU on colour-conversion and Qt signal dispatch.
+    _FRAME_INTERVAL = 1.0 / 30.0
+
     def __init__(self, callback):
         self._callback = callback
+        self._last_ts: float = 0.0
 
     def sink_connected(self, sink, image_type, min_buffers_required) -> bool:
         return True
 
     def frames_queued(self, sink):
+        now = time.monotonic()
+        if now - self._last_ts < self._FRAME_INTERVAL:
+            # Drop this frame — consume the buffer to keep the queue healthy
+            try:
+                sink.pop_output_buffer()
+            except Exception:
+                pass
+            return
+        self._last_ts = now
         buffer = sink.pop_output_buffer()
         buffer_wrap = buffer.numpy_wrap()
-        rgb_img = cv2.cvtColor(buffer_wrap, cv2.COLOR_BGR2RGB)
+        # ascontiguousarray ensures the RGB result has a stable C-order
+        # layout before it travels across the Qt signal boundary.
+        rgb_img = np.ascontiguousarray(
+            cv2.cvtColor(buffer_wrap, cv2.COLOR_BGR2RGB)
+        )
         self._callback(rgb_img)
 
 
@@ -159,4 +180,3 @@ class CameraService(QObject):
 
         except Exception as e:
             print(f"Error applying configuration from {path}: {e}")
-

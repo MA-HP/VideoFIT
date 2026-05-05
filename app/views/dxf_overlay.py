@@ -15,10 +15,10 @@ import ezdxf
 from ezdxf.addons.drawing import Frontend, RenderContext
 from ezdxf.addons.drawing.pyqt import PyQtBackend
 from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QTransform
+from PySide6.QtGui import QBrush, QColor, QImage, QTransform
 from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsScene,
+    QGraphicsView,
 )
 
 from app.models.fit_result import FitResult
@@ -35,6 +35,27 @@ class DxfOverlay:
     def __init__(self, scene: QGraphicsScene) -> None:
         self._scene = scene
         self._items: list[QGraphicsItem] = []
+        # Heatmap brush cache — rebuilding the full numpy RGBA pipeline is
+        # expensive; skip it when the distance field and thresholds haven't changed.
+        self._brush_cache: QBrush | None = None
+        self._brush_cache_key: tuple | None = None
+
+    # ── Viewport helpers ─────────────────────────────────────────────
+
+    def _set_viewport_updates(self, enabled: bool) -> None:
+        """Block/restore viewport repaints on all attached views.
+
+        When ezdxf pumps hundreds of items into the scene each one triggers
+        a repaint.  Disabling updates during that burst and doing a single
+        repaint at the end is significantly faster.
+        """
+        mode = (QGraphicsView.MinimalViewportUpdate if enabled
+                else QGraphicsView.NoViewportUpdate)
+        for view in self._scene.views():
+            if isinstance(view, QGraphicsView):
+                view.setViewportUpdateMode(mode)
+                if enabled:
+                    view.viewport().update()
 
     # ── Public ───────────────────────────────────────────────────────
 
@@ -45,9 +66,7 @@ class DxfOverlay:
         self._items.clear()
 
     def draw_preview(self, dxf: Dxf) -> None:
-        """
-        Draw DXF using ezdxf PyQtBackend.
-        """
+        """Draw DXF using ezdxf PyQtBackend (preview / pre-alignment)."""
         self.clear()
 
         if dxf.doc is None:
@@ -55,34 +74,25 @@ class DxfOverlay:
 
         ctx = RenderContext(dxf.doc)
         backend = PyQtBackend(scene=self._scene)
+        config = Configuration(background_policy=BackgroundPolicy.OFF)
 
-        config = Configuration(
-            background_policy=BackgroundPolicy.OFF,
-        )
+        # Snapshot existing item ids BEFORE rendering so we can identify the
+        # new ones afterwards without a second render pass.
+        ids_before = {id(i) for i in self._scene.items()}
 
-        frontend = Frontend(ctx, backend, config=config)
-        frontend.draw_layout(dxf.doc.modelspace(), finalize=True)
+        self._set_viewport_updates(False)
+        try:
+            Frontend(ctx, backend, config=config).draw_layout(
+                dxf.doc.modelspace(), finalize=True
+            )
+        finally:
+            self._set_viewport_updates(True)
 
-        dxf_group = self._scene.createItemGroup([])
-        for item in self._scene.items():
-            if item not in self._items and getattr(item, 'zValue', lambda: 0)() == 0 and item.parentItem() is None:
-                # We need a proper way to distinguish dxf items. For now we assume new items.
-                pass
-
-        # ACTUALLY, we should clear and group properly, let's fix it this way:
-        # Collect items before:
-        items_before = set(self._scene.items())
-
-        frontend = Frontend(ctx, backend, config=config)
-        frontend.draw_layout(dxf.doc.modelspace(), finalize=True)
-
-        items_after = set(self._scene.items())
-        new_items = items_after - items_before
+        new_items = [i for i in self._scene.items() if id(i) not in ids_before]
 
         group = self._scene.createItemGroup([])
         for item in new_items:
-            # We override colors for preview
-            if isinstance(item, QGraphicsPathItem) or isinstance(item, QGraphicsLineItem):
+            if isinstance(item, (QGraphicsPathItem, QGraphicsLineItem)):
                 pen = item.pen()
                 pen.setColor(_PREVIEW_COLOR)
                 pen.setCosmetic(True)
@@ -90,29 +100,20 @@ class DxfOverlay:
                 item.setPen(pen)
             group.addToGroup(item)
 
-        # Apply the scaling and translation identical to dxf_service.py
         if dxf.canvas_shape[0] != 0:
             H, W = dxf.canvas_shape
             canvas_cx, canvas_cy = W / 2.0, H / 2.0
             dxf_cx, dxf_cy = dxf.dxf_center_mm
             px_per_mm = dxf.px_per_mm
 
-            # transform steps:
-            # 1. translate so dxf_center_mm is at (0,0)
-            # 2. scale to pixels (and flip Y)
-            # 3. translate to canvas center
-
             t = QTransform()
             t.translate(canvas_cx, canvas_cy)
             t.scale(px_per_mm, -px_per_mm)
             t.translate(-dxf_cx, -dxf_cy)
-
             group.setTransform(t)
 
         group.setZValue(100)
         self._items.append(group)
-        # We also need to transform it if needed, or if it is already in px we are fine. Wait, dxf.doc is in mm.
-        # But we need it in px.
 
     def draw_heatmap(
         self,
@@ -124,12 +125,7 @@ class DxfOverlay:
         color_mid: str = "#FF8000",
         color_high: str = "#FF0000",
     ) -> None:
-        """
-        Draw DXF natively using ezdxf PyQtBackend, applying a heatmap color
-        to each native item based on its distance to the nearest real edge.
-        color_low at heatmap_min, color_mid at heatmap_max, color_high above heatmap_max.
-        Uses the raw (unsmoothed) distance field for accurate distance display.
-        """
+        """Draw aligned DXF with per-pixel heatmap colouring."""
         self.clear()
         dist_field = result.dist_raw if result.dist_raw is not None else result.dist_t
         self._draw_aligned_native(dxf, result, dist_t=dist_field,
@@ -151,19 +147,22 @@ class DxfOverlay:
 
         ctx = RenderContext(dxf.doc)
         backend = PyQtBackend(scene=self._scene)
-
         config = Configuration(
             background_policy=BackgroundPolicy.OFF,
             line_policy=ezdxf.addons.drawing.config.LinePolicy.SOLID,
         )
 
-        items_before = set(self._scene.items())
+        ids_before = {id(i) for i in self._scene.items()}
 
-        frontend = Frontend(ctx, backend, config=config)
-        frontend.draw_layout(dxf.doc.modelspace(), finalize=True)
+        self._set_viewport_updates(False)
+        try:
+            Frontend(ctx, backend, config=config).draw_layout(
+                dxf.doc.modelspace(), finalize=True
+            )
+        finally:
+            self._set_viewport_updates(True)
 
-        items_after = set(self._scene.items())
-        new_items = items_after - items_before
+        new_items = [i for i in self._scene.items() if id(i) not in ids_before]
 
         if dxf.canvas_shape[0] != 0:
             canvas_H, canvas_W = dxf.canvas_shape
@@ -187,12 +186,18 @@ class DxfOverlay:
             final_t = QTransform()
 
         if dist_t is not None:
-            brush = self._create_heatmap_brush(dist_t, final_t,
-                                               heatmap_min=heatmap_min,
-                                               heatmap_max=heatmap_max,
-                                               color_low=color_low,
-                                               color_mid=color_mid,
-                                               color_high=color_high)
+            # Reuse the cached brush when the same distance field + thresholds
+            # are used again (e.g. after a simple pan/zoom redraw).
+            cache_key = (id(dist_t), heatmap_min, heatmap_max,
+                         color_low, color_mid, color_high)
+            if cache_key != self._brush_cache_key:
+                self._brush_cache = self._create_heatmap_brush(
+                    dist_t, final_t,
+                    heatmap_min=heatmap_min, heatmap_max=heatmap_max,
+                    color_low=color_low, color_mid=color_mid, color_high=color_high,
+                )
+                self._brush_cache_key = cache_key
+            brush = self._brush_cache
         else:
             brush = QBrush(QColor(color_low))
 
@@ -217,12 +222,8 @@ class DxfOverlay:
                                color_mid: str = "#FF8000",
                                color_high: str = "#FF0000") -> QBrush:
         H, W = dist_t.shape
-
         d = dist_t.astype(np.float32)
 
-        # Two-zone scheme:
-        #   In tolerance  (d ≤ heatmap_max): color_low → color_mid gradient
-        #   Out of tolerance (d > heatmap_max): hard color_high
         ql = QColor(color_low)
         qm = QColor(color_mid)
         qh = QColor(color_high)
@@ -240,41 +241,23 @@ class DxfOverlay:
         b = np.where(out_of_tol, np.uint8(qh.blue()),  b_in).astype(np.uint8)
         a = np.full(d.shape, 255, dtype=np.uint8)
 
-        img_data = np.stack([r, g, b, a], axis=-1)
-
-        # Garantir que le bloc de mémoire est contigu pour QImage afin d'éviter tout crash
-        self._heatmap_img_data = np.ascontiguousarray(img_data)
+        # Stack into RGBA and pin the array so the QImage buffer stays valid
+        self._heatmap_img_data = np.ascontiguousarray(np.stack([r, g, b, a], axis=-1))
 
         qimg = QImage(
             self._heatmap_img_data.data,
-            W, H,
-            W * 4,
-            QImage.Format.Format_RGBA8888
+            W, H, W * 4,
+            QImage.Format.Format_RGBA8888,
         )
 
         brush = QBrush(qimg)
-        # The brush texture space is identically the canvas pixel space (0..W, 0..H).
-        # The item being drawn is in "DXF native space".
-        # When the user draws at local native (0,0), it transforms to scene QTransform(final_t) -> (X,Y) scene pixel.
-        # But QBrush uses its own transform from Texture -> Item Local space!
-        # If we want Texture Space (Canvas pixels) to exactly align with Scene Space (Canvas pixels),
-        # Texture Space = Item Local Space * final_t.
-        # Thus the brush transform from Texture Space to Item Local Space is the INVERSE of final_t!
-
         inv_t, invertible = final_t.inverted()
         if invertible:
             brush.setTransform(inv_t)
-
         return brush
 
-def _distance_to_color(d: float, heatmap_min: float = 1.0, heatmap_max: float = 3.0) -> QColor:
-    """
-    Map a distance-transform value to a heatmap color.
 
-      ≤ heatmap_min px  →  pure green  (0, 255, 0)
-      min … max px      →  green → yellow → red gradient
-      ≥ heatmap_max px  →  pure red    (255, 0, 0)
-    """
+def _distance_to_color(d: float, heatmap_min: float = 1.0, heatmap_max: float = 3.0) -> QColor:
     span = max(heatmap_max - heatmap_min, 1e-6)
     t = max(0.0, min(1.0, (d - heatmap_min) / span))
     r = int(255 * t)
