@@ -11,6 +11,8 @@ Resolution-Independent Metrology Refactor:
   prevent symmetric perimeters (gear teeth) from dominating the rotation.
 - CuPy Acceleration: Fused C++ kernels evaluate the grid sweep and
   Powell iterations entirely in VRAM for sub-second performance.
+- Multi-Candidate Refinement: Evaluates top 5 distinct local minima from the
+  sweep grid to guarantee avoidance of local optimizer traps.
 """
 
 from __future__ import annotations
@@ -229,7 +231,6 @@ def fit(
     diag = np.hypot(H, W)
 
     # ── Step 1: Adaptive CPU Smoothing ────────────────────────────────
-    # Blur radius scales with resolution (0.05% of diagonal)
     sigma_val = max(0.5, diag * 0.0005)
     dist_smooth = cv2.GaussianBlur(distance_field.astype(np.float32), (0, 0), sigma_val)
     dist_smooth_cp = cp.ascontiguousarray(cp.asarray(dist_smooth), dtype=cp.float32)
@@ -245,7 +246,6 @@ def fit(
     dxf_cx, dxf_cy = (dxf_min_x + dxf_max_x) / 2.0, (dxf_min_y + dxf_max_y) / 2.0
 
     scene_cx, scene_cy = W / 2.0, H / 2.0
-    # Threshold distance field to create a "fat" mask (2% of diagonal)
     blob_thresh = diag * 0.02
     thick_edges = (distance_field < blob_thresh).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thick_edges, connectivity=8)
@@ -274,7 +274,6 @@ def fit(
     # ── Step 5: Resolution-Independent Fused Sweep ────────────────────
     num_angles, num_gx, num_gy = 360, 21, 21
     angles_cp = cp.linspace(-cp.pi, cp.pi, num_angles, endpoint=False, dtype=cp.float32)
-    # Search range is 5% of image diagonal
     search_range = diag * 0.05
     gx_cp = cp.linspace(-search_range, search_range, num_gx, dtype=cp.float32)
     gy_cp = cp.linspace(-search_range, search_range, num_gy, dtype=cp.float32)
@@ -296,18 +295,70 @@ def fit(
          W, H, len(dxf_x_cp), cp.float32(dxf_cx), cp.float32(dxf_cy), cp.float32(tx_init), cp.float32(ty_init),
          cp.float32(sweep_delta), cp.float32(diag), num_gx, num_gy, num_angles))
 
-    flat_idx = int(cp.argmin(costs_cp))
-    iy, ix, ia = np.unravel_index(flat_idx, (num_gy, num_gx, num_angles))
-    best_candidate = [tx_init + float(gx_cp[ix]), ty_init + float(gy_cp[iy]), float(angles_cp[ia])]
+    # ── Step 6: Multi-Candidate NMS & Powell Refinement ───────────────
+    # Move costs to CPU to efficiently find the top 5 distinct minimums
+    costs_np = cp.asnumpy(costs_cp)
+    flat_indices = np.argsort(costs_np.ravel())
 
-    # ── Step 6: Powell Refinement ─────────────────────────────────────
-    res_pull = minimize(cost_pull, np.array(best_candidate), method="Powell", options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 20})
-    final_res = minimize(cost_polish, res_pull.x, method="Powell", options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 75})
+    k_candidates = 5
+    candidates = []
 
-    tx_opt, ty_opt, angle_opt = final_res.x
-    inlier_frac = _compute_inlier_frac(polylines, final_res.x, dist_smooth_cp, dxf_cx, dxf_cy, max_error_px)
+    # Thresholds for Non-Maximum Suppression (ensures candidates are distinct)
+    step_x = float(gx_cp[1] - gx_cp[0]) if num_gx > 1 else 1.0
+    step_y = float(gy_cp[1] - gy_cp[0]) if num_gy > 1 else 1.0
+    step_a = float(angles_cp[1] - angles_cp[0]) if num_angles > 1 else 1.0
 
-    return FitResult(tx=float(tx_opt), ty=float(ty_opt), angle_deg=float(np.degrees(angle_opt)), cost=float(final_res.fun),
+    min_dist_sq = (max(step_x, step_y) * 2.0) ** 2  # At least 2 grid cells apart
+    min_ang = step_a * 3.0                          # At least 3 angular steps apart
+
+    for flat_idx in flat_indices:
+        iy, ix, ia = np.unravel_index(flat_idx, (num_gy, num_gx, num_angles))
+        cx = tx_init + float(gx_cp[ix])
+        cy = ty_init + float(gy_cp[iy])
+        ct = float(angles_cp[ia])
+
+        # Check against already saved distinct candidates
+        is_distinct = True
+        for (ex, ey, et) in candidates:
+            dist_sq = (cx - ex)**2 + (cy - ey)**2
+            ang_diff = abs(ct - et)
+            ang_diff = min(ang_diff, 2 * np.pi - ang_diff) # Handle wrap-around
+
+            if dist_sq < min_dist_sq and ang_diff < min_ang:
+                is_distinct = False
+                break
+
+        if is_distinct:
+            candidates.append((cx, cy, ct))
+            if len(candidates) >= k_candidates:
+                break
+
+    # Fallback (rare): Just fill up to K if the grid was extremely uniform
+    if len(candidates) < k_candidates:
+        for flat_idx in flat_indices:
+            iy, ix, ia = np.unravel_index(flat_idx, (num_gy, num_gx, num_angles))
+            cand = (tx_init + float(gx_cp[ix]), ty_init + float(gy_cp[iy]), float(angles_cp[ia]))
+            if cand not in candidates:
+                candidates.append(cand)
+            if len(candidates) >= k_candidates:
+                break
+
+    # Evaluate the Top 5 candidates through Powell to find the global best
+    best_final_cost = float('inf')
+    best_final_params = None
+
+    for cand in candidates:
+        res_pull = minimize(cost_pull, np.array(cand), method="Powell", options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 20})
+        final_res = minimize(cost_polish, res_pull.x, method="Powell", options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 75})
+
+        if final_res.fun < best_final_cost:
+            best_final_cost = final_res.fun
+            best_final_params = final_res.x
+
+    tx_opt, ty_opt, angle_opt = best_final_params
+    inlier_frac = _compute_inlier_frac(polylines, best_final_params, dist_smooth_cp, dxf_cx, dxf_cy, max_error_px)
+
+    return FitResult(tx=float(tx_opt), ty=float(ty_opt), angle_deg=float(np.degrees(angle_opt)), cost=float(best_final_cost),
                      dxf_cx=dxf_cx, dxf_cy=dxf_cy, inlier_frac=inlier_frac, dist_t=cp.asnumpy(dist_smooth_cp),
                      dist_raw=distance_field.astype(np.float32))
 

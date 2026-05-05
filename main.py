@@ -14,7 +14,7 @@ from app.orchestrator import AppOrchestrator
 # ── Developer flag ────────────────────────────────────────────────────────────
 # Set to True to enable the Debug Preprocessing panel in the Settings menu.
 # Leave False for production / end-user builds.
-DEBUG = True
+DEBUG = False
 
 
 def main() -> None:
