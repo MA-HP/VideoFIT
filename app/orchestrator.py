@@ -13,6 +13,7 @@ from app.models.settings import AppSettings
 from app.services.camera_service import CameraService
 from app.presenters.camera_presenter import CameraPresenter
 from app.presenters.compare_presenter import ComparePresenter
+from app.presenters.lighting_presenter import LightingPresenter
 from app.presenters.measure_presenter import MeasurePresenter
 from app.presenters.settings_presenter import SettingsPresenter
 from app.views.main_window import MetrologyWindow
@@ -53,6 +54,17 @@ class AppOrchestrator:
             settings=self._settings,
             panel=self._window.settings_panel,
             toggle_button=self._window.btn_settings,
+        )
+
+        self._lighting_presenter = LightingPresenter(
+            settings=self._settings,
+            panel=self._window.lighting_panel,
+            toggle_button=self._window.btn_lighting,
+        )
+
+        # When camera changes, load the matching lighting preset
+        self._window.settings_panel.combo_camera.currentTextChanged.connect(
+            self._lighting_presenter.load_camera_preset
         )
 
         self._camera_presenter = CameraPresenter(

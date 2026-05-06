@@ -25,6 +25,7 @@ class SettingsPresenter(QObject):
         self._settings = settings
         self._panel = panel
         self._toggle_btn = toggle_button
+        self._panel.set_toggle_button(toggle_button)
 
         # Apply defaults from the model into the view
         self._panel.combo_comparison.setCurrentText(settings.app_defaults.comparison_mode)

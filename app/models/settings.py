@@ -17,8 +17,13 @@ class CameraInfo:
     serial: str = ""
     config_file: str = ""
     calibration_px_mm: str = "0.0"
-    heatmap_min_error: float = 0.1   # mm — below this = fully green
-    heatmap_max_error: float = 0.5   # mm — above this = fully red
+    heatmap_min_error: float = 0.1
+    heatmap_max_error: float = 0.5
+    # Per-camera light intensities (0–100)
+    light_ch1_intensity: float = 100.0
+    light_ch2_intensity: float = 0.0
+    light_ch3_intensity: float = 0.0
+    light_ch4_intensity: float = 0.0
 
 
 @dataclass
@@ -26,9 +31,17 @@ class AppDefaults:
     """Application-level default values."""
     comparison_mode: str = "Best Fit"
     fit_objective: str = "Strict"
-    heatmap_color_low: str = "#00FF00"   # color at heatmap_min (in-tolerance)
-    heatmap_color_mid: str = "#FF8000"   # color at heatmap_max boundary
-    heatmap_color_high: str = "#FF0000"  # color above heatmap_max (out-of-tolerance)
+    heatmap_color_low: str = "#00FF00"
+    heatmap_color_mid: str = "#FF8000"
+    heatmap_color_high: str = "#FF0000"
+    # Which channels are active by default
+    light_ch1_active: bool = True
+    light_ch2_active: bool = False
+    light_ch3_active: bool = True
+    light_ch4_active: bool = True
+    # Lighting controller network settings
+    lighting_ip: str = "169.254.5.100"
+    lighting_port: int = 62077
 
 
 @dataclass
@@ -55,6 +68,12 @@ class AppSettings:
                 heatmap_color_low=defaults_raw.get("heatmap_color_low", "#00FF00"),
                 heatmap_color_mid=defaults_raw.get("heatmap_color_mid", "#FF8000"),
                 heatmap_color_high=defaults_raw.get("heatmap_color_high", "#FF0000"),
+                light_ch1_active=bool(defaults_raw.get("light_ch1_active", True)),
+                light_ch2_active=bool(defaults_raw.get("light_ch2_active", False)),
+                light_ch3_active=bool(defaults_raw.get("light_ch3_active", True)),
+                light_ch4_active=bool(defaults_raw.get("light_ch4_active", True)),
+                lighting_ip=defaults_raw.get("lighting_ip", "169.254.5.100"),
+                lighting_port=int(defaults_raw.get("lighting_port", 62077)),
             )
 
             cameras = [
@@ -65,6 +84,10 @@ class AppSettings:
                     calibration_px_mm=c.get("calibration_px_mm", "0.0"),
                     heatmap_min_error=float(c.get("heatmap_min_error", 1.0)),
                     heatmap_max_error=float(c.get("heatmap_max_error", 3.0)),
+                    light_ch1_intensity=float(c.get("light_ch1_intensity", 100.0)),
+                    light_ch2_intensity=float(c.get("light_ch2_intensity", 0.0)),
+                    light_ch3_intensity=float(c.get("light_ch3_intensity", 0.0)),
+                    light_ch4_intensity=float(c.get("light_ch4_intensity", 0.0)),
                 )
                 for c in raw.get("cameras", [])
             ]

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QFrame, QPushButton, QSizeGrip, QVBoxLayout, QWidg
 from app.constants import MARGIN, SETTINGS_BTN_STYLE
 from app.views.icon_manager import IconManager
 from app.views.image_viewer import ImageViewer
+from app.views.lighting_panel import LightingPanel
 from app.views.settings_panel import SettingsPanel
 from app.views.title_bar import TitleBar
 from app.views.toolbar import Toolbar
@@ -82,7 +83,15 @@ class MetrologyWindow(QWidget):
         self.btn_settings.setCheckable(True)
         self.btn_settings.setStyleSheet(SETTINGS_BTN_STYLE)
 
+        self.btn_lighting = QPushButton(self._work_area)
+        self.btn_lighting.setIcon(IconManager.get_icon("light", "💡"))
+        self.btn_settings.setIconSize(QSize(24, 24))
+        self.btn_lighting.setFixedSize(45, 45)
+        self.btn_lighting.setCheckable(True)
+        self.btn_lighting.setStyleSheet(SETTINGS_BTN_STYLE)
+
         self.settings_panel = SettingsPanel(self._work_area)
+        self.lighting_panel = LightingPanel(parent=self._work_area)  # channels set later by presenter
         self.toolbar = Toolbar(self._work_area)
 
         self._size_grip = QSizeGrip(self._container)
@@ -96,11 +105,21 @@ class MetrologyWindow(QWidget):
         wa_w = self._work_area.width()
         wa_h = self._work_area.height()
 
+        # Settings button — top-right
         self.btn_settings.move(wa_w - self.btn_settings.width() - MARGIN, MARGIN)
         self.settings_panel.move(
             wa_w - self.settings_panel.width() - MARGIN,
             MARGIN + self.btn_settings.height() + 10,
         )
+
+        # Lighting button — below settings button
+        light_btn_y = MARGIN + self.btn_settings.height() + 10
+        self.btn_lighting.move(wa_w - self.btn_lighting.width() - MARGIN, light_btn_y)
+        self.lighting_panel.move(
+            wa_w - self.lighting_panel.width() - MARGIN,
+            light_btn_y + self.btn_lighting.height() + 10,
+        )
+
         self.toolbar.move(
             (wa_w - self.toolbar.width()) // 2,
             wa_h - self.toolbar.height() - MARGIN,
