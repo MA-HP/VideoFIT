@@ -27,3 +27,4 @@ class Dxf:
     # Layer-separated polylines for POC mode
     polylines_rot: list[np.ndarray] = field(default_factory=list)      # ROT layer
     polylines_pan: list[np.ndarray] = field(default_factory=list)      # PAN layer
+    dxf_area_px: float = 0.0                                           # outer silhouette area (px²)

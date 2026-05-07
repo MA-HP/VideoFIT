@@ -6,11 +6,34 @@ The DxfData dataclass (pure structure) lives in app.models.dxf_model.
 
 from __future__ import annotations
 
+import cv2
 import ezdxf
 from ezdxf import path
 import numpy as np
 
 from app.models.dxf import Dxf
+
+
+def _outer_silhouette_area_px(polylines: list[np.ndarray], canvas_shape: tuple[int, int]) -> float:
+    """Rasterize polylines, bridge tiny gaps, and return the area enclosed by
+    the largest external contour. Holes inside the part are ignored on purpose."""
+    if not polylines:
+        return 0.0
+    H, W = canvas_shape
+    canvas = np.zeros((H, W), dtype=np.uint8)
+    for poly in polylines:
+        if len(poly) < 2:
+            continue
+        pts = np.round(poly).astype(np.int32)
+        cv2.polylines(canvas, [pts], isClosed=False, color=255, thickness=2)
+    canvas = cv2.morphologyEx(
+        canvas, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    contours, _ = cv2.findContours(canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    return float(max(cv2.contourArea(c) for c in contours))
 
 
 def load_dxf(
@@ -102,6 +125,8 @@ def load_dxf(
         else:
             polylines_global.append(poly_px)
 
+    dxf_area_px = _outer_silhouette_area_px(polylines, canvas_shape)
+
     return Dxf(
         polylines=polylines,
         dxf_center_mm=(float(dxf_cx), float(dxf_cy)),
@@ -112,4 +137,5 @@ def load_dxf(
         polylines_refine=polylines_refine,
         polylines_rot=polylines_rot,
         polylines_pan=polylines_pan,
+        dxf_area_px=dxf_area_px,
     )

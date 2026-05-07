@@ -47,11 +47,20 @@ class _FitWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            # Edge detection (expects BGR)
+            # Edge detection (expects BGR). The expected DXF silhouette area
+            # is forwarded so the silhouette pipeline can pick the connected
+            # component that actually corresponds to the part — not glare or
+            # noise blobs that happen to be larger.
+            expected_area_px = float(self.dxf_data.dxf_area_px)
             if self.debug:
-                edge_result, stages = compute_edges(self.frame_bgr, capture_stages=True)
+                edge_result, stages = compute_edges(
+                    self.frame_bgr, capture_stages=True,
+                    expected_area_px=expected_area_px,
+                )
             else:
-                edge_result = compute_edges(self.frame_bgr)
+                edge_result = compute_edges(
+                    self.frame_bgr, expected_area_px=expected_area_px,
+                )
                 stages = None
 
             if self.mode == "POC":

@@ -155,6 +155,83 @@ _CPU_CLOSE_K = np.ones((3, 3), dtype=np.uint8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Silhouette pipeline (Otsu + connected components, area-matched against DXF)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_silhouette_mask(
+    gray: np.ndarray,
+    expected_area_px: float | None,
+) -> np.ndarray | None:
+    """
+    Robust part-localisation against noise / light artefacts.
+
+    Pipeline: Gaussian blur → ellipse open → ellipse close ×2 → Otsu (both
+    polarities) → connected components → pick the blob whose area is closest
+    to the rasterized DXF area (border-touching blobs are penalised).
+
+    Holes are filled (RETR_EXTERNAL fill) so the centroid reflects the outer
+    silhouette only — matches the DXF convention.
+
+    Returns None if no plausible blob is found.
+    """
+    H, W = gray.shape
+    img_area = float(H * W)
+
+    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+    opened = cv2.morphologyEx(blurred, cv2.MORPH_OPEN, k_open, iterations=1)
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, k_close, iterations=2)
+
+    _, bin_pos = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    bin_neg = cv2.bitwise_not(bin_pos)
+
+    best_score = float('inf')
+    best_label_img = None
+    best_label_idx = -1
+
+    for binimg in (bin_pos, bin_neg):
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(binimg, connectivity=8)
+        for i in range(1, n):
+            area = float(stats[i, cv2.CC_STAT_AREA])
+            # Reject specks and components that fill the whole frame
+            if area < 0.001 * img_area or area > 0.95 * img_area:
+                continue
+
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            border_touch = (x == 0) or (y == 0) or (x + w >= W) or (y + h >= H)
+
+            if expected_area_px and expected_area_px > 0:
+                score = abs(area - expected_area_px) / expected_area_px
+            else:
+                # No DXF reference: prefer the largest interior blob
+                score = img_area / area
+            if border_touch:
+                score *= 3.0
+
+            if score < best_score:
+                best_score = score
+                best_label_img = labels
+                best_label_idx = i
+
+    if best_label_img is None:
+        return None
+
+    raw = (best_label_img == best_label_idx).astype(np.uint8) * 255
+
+    # Fill any interior holes — we want the outer silhouette mask
+    contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return raw
+    filled = np.zeros_like(raw)
+    cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
+    return filled
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -166,7 +243,8 @@ def compute_edges(
     low_thresh: float = 30.0,
     min_curvature: float = 3.0,
     min_edge_length: int = 25,
-    downsample: float = 1.0
+    downsample: float = 1.0,
+    expected_area_px: float | None = None,
 ) -> "EdgeResult | tuple[EdgeResult, dict]":
     """
     Run the fully-fused, GPU-accelerated Canny-Devernay edge pipeline on a BGR frame.
@@ -180,6 +258,11 @@ def compute_edges(
     H, W = gray.shape[:2]
     if capture_stages:
         stages["gray"] = gray.copy()
+
+    # ── Step 1b: Robust silhouette mask (area-matched to DXF) ──────────────
+    silhouette_mask = _compute_silhouette_mask(gray, expected_area_px)
+    if capture_stages and silhouette_mask is not None:
+        stages["silhouette_mask"] = silhouette_mask.copy()
 
     # ── Step 2: Prepare Downsample ──────────────────────────────────────────
     if downsample != 1.0:
@@ -309,12 +392,22 @@ def compute_edges(
             viz_cp[ys_render, xs_render] = 255
         stages["edge_points_viz"] = cp.asnumpy(viz_cp)
 
-    # ── Step 12: Centroid from coordinate-wise median (GPU) ─────────────────
-    if len(edge_points_cp) > 0:
-        cx = float(cp.median(xs_cp))
-        cy = float(cp.median(ys_cp))
-    else:
-        cx, cy = W / 2.0, H / 2.0
+    # ── Step 12: Centroid — prefer area-matched silhouette moments ──────────
+    # The mass-balanced centroid of the chosen silhouette blob is far more
+    # robust against speckle noise and EPI/DIA glare than the edge-point
+    # median (the median still drifts when one side carries spurious edges).
+    cx, cy = None, None
+    if silhouette_mask is not None:
+        M = cv2.moments(silhouette_mask)
+        if M["m00"] > 0:
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+    if cx is None:
+        if len(edge_points_cp) > 0:
+            cx = float(cp.median(xs_cp))
+            cy = float(cp.median(ys_cp))
+        else:
+            cx, cy = W / 2.0, H / 2.0
 
     # ── Step 13: Distance Transform (GPU) ───────────────────────────────────
     if len(edge_points_cp) > 0:
@@ -329,7 +422,7 @@ def compute_edges(
     # ── Step 14: Final PCIe Download ────────────────────────────────────────
     # The arrays are downloaded only once, right at the end.
     result = EdgeResult(
-        mask=None,
+        mask=silhouette_mask,
         edges=cp.asnumpy(edge_map_cp),
         distance_field=cp.asnumpy(dist_cp),
         silhouette_centroid=np.array([cx, cy]),
