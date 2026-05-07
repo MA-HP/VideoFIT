@@ -115,6 +115,7 @@ SETTINGS_BTN_STYLE = GLASS_STYLE + """
         border-radius: 22px;
         background-color: rgba(15, 15, 15, 180);
         border: 1px solid rgba(255, 255, 255, 25);
+        padding: 0px;
     }
     QPushButton:checked { background-color: rgba(255, 255, 255, 30); }
 """

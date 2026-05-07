@@ -32,7 +32,7 @@ def _make_tool_page(
         if item == "|":
             sep = QFrame()
             sep.setFrameShape(QFrame.VLine)
-            sep.setStyleSheet("background-color: rgba(255, 255, 255, 20); width: 1px; margin: 0 4px;")
+            sep.setStyleSheet("background-color: rgba(255, 255, 255, 45); width: 1px; margin: 0 4px;")
             layout.addWidget(sep)
             continue
 
@@ -139,7 +139,7 @@ class Toolbar(QWidget):
 
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
-        sep.setStyleSheet("background-color: rgba(255, 255, 255, 20); width: 1px;")
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 45); width: 1px;")
         bottom_layout.addWidget(sep)
 
         # Main Tool Stack

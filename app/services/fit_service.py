@@ -8,7 +8,6 @@ from scipy.optimize import minimize
 
 from app.models.fit_result import FitResult
 
-
 # -----------------------------------------------------------------------------
 # CUDA Kernels (Windows-Safe ASCII format)
 # -----------------------------------------------------------------------------
@@ -51,12 +50,12 @@ void fused_sweep_kernel(
         if (nx >= 0.0f && nx < (width - 1.0f) && ny >= 0.0f && ny < (height - 1.0f)) {
             val = tex2D<float>(dist_tex, nx + 0.5f, ny + 0.5f);
         }
-        
+
         float w = pt_weights[p];
         float v_d = val / delta;
         total_cost += w * (1.0f - expf(-0.5f * v_d * v_d));
     }
-    
+
     int out_idx = (iy * num_gx + ix) * num_angles + ia;
     out_costs[out_idx] = total_cost / (float)num_pts;
 }
@@ -71,10 +70,10 @@ void point_cost_huber(
     float delta, float weight, float oob_dist)
 {
     __shared__ float sdata[256];
-    
+
     int p = blockIdx.x * blockDim.x + threadIdx.x; 
     int tid = threadIdx.x;                         
-    
+
     float my_cost = 0.0f;
 
     if (p < num_pts) {
@@ -94,7 +93,7 @@ void point_cost_huber(
         float v_d = val / delta;
         my_cost = w * weight * delta * delta * (sqrtf(1.0f + v_d * v_d) - 1.0f);
     }
-    
+
     sdata[tid] = my_cost;
     __syncthreads();
 
@@ -116,10 +115,10 @@ void point_cost_welsch(
     float delta, float weight, float oob_dist)
 {
     __shared__ float sdata[256];
-    
+
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
-    
+
     float my_cost = 0.0f;
 
     if (p < num_pts) {
@@ -139,7 +138,7 @@ void point_cost_welsch(
         float v_d = val / delta;
         my_cost = w * (1.0f - expf(-0.5f * v_d * v_d));
     }
-    
+
     sdata[tid] = my_cost;
     __syncthreads();
 
@@ -262,12 +261,10 @@ def fit(
     diag = np.hypot(H, W)
 
     # -- Step 1: GPU-Native Adaptive Smoothing -------------------------
-    # Keep the image in VRAM to eliminate the D2H/H2D PCIe transfer penalty
     dist_field_cp = cp.asarray(distance_field, dtype=cp.float32)
     sigma_val = max(0.5, diag * 0.0005)
     dist_smooth_cp = cp.ascontiguousarray(gaussian_filter(dist_field_cp, sigma=sigma_val))
 
-    # Bind to hardware texture memory
     dist_tex = _create_texture_object(dist_smooth_cp)
 
     # -- Step 2: DXF Samples -------------------------------------------
@@ -275,20 +272,30 @@ def fit(
     dxf_sweep = _stride_subsample(dxf_all, n=800)
     dxf_sample = _stride_subsample(dxf_all, n=3000)
 
-    dxf_min_x, dxf_max_x = float(dxf_all[:, 0].min()), float(dxf_all[:, 0].max())
-    dxf_min_y, dxf_max_y = float(dxf_all[:, 1].min()), float(dxf_all[:, 1].max())
-    dxf_cx, dxf_cy = (dxf_min_x + dxf_max_x) / 2.0, (dxf_min_y + dxf_max_y) / 2.0
+    # CORRECTION 1 : Utilisation de la moyenne des points comme proxy du centre de masse
+    dxf_cx, dxf_cy = float(dxf_all[:, 0].mean()), float(dxf_all[:, 1].mean())
 
-    # -- Step 3: Blob-Locked Centroids ---------------------------------
+    # -- Step 3: Mass-Locked Centroids ---------------------------------
+    # CORRECTION 2 : Utilisation des moments pour trouver le vrai centre de la forme
     scene_cx, scene_cy = W / 2.0, H / 2.0
-    blob_thresh = diag * 0.02
-    thick_edges = (distance_field < blob_thresh).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thick_edges, connectivity=8)
 
-    if num_labels > 1:
-        largest_idx = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
-        scene_cx = stats[largest_idx, cv2.CC_STAT_LEFT] + stats[largest_idx, cv2.CC_STAT_WIDTH] / 2.0
-        scene_cy = stats[largest_idx, cv2.CC_STAT_TOP] + stats[largest_idx, cv2.CC_STAT_HEIGHT] / 2.0
+    if silhouette_mask is not None:
+        M = cv2.moments(silhouette_mask)
+        if M["m00"] != 0:
+            scene_cx = M["m10"] / M["m00"]
+            scene_cy = M["m01"] / M["m00"]
+    else:
+        blob_thresh = diag * 0.02
+        thick_edges = (distance_field < blob_thresh).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thick_edges, connectivity=8)
+
+        if num_labels > 1:
+            largest_idx = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
+            mask_largest = (labels == largest_idx).astype(np.uint8)
+            M = cv2.moments(mask_largest)
+            if M["m00"] != 0:
+                scene_cx = M["m10"] / M["m00"]
+                scene_cy = M["m01"] / M["m00"]
 
     tx_init, ty_init = scene_cx - dxf_cx, scene_cy - dxf_cy
 
@@ -303,14 +310,14 @@ def fit(
     pt_weights[radii < r_max * 0.92] = 5.0
     pt_weights_cp = cp.asarray(pt_weights, dtype=cp.float32)
 
-    # Note: passing dist_tex and dimensions instead of the raw pointer array
     cost_pull = _make_cost_fn(dxf_c_cp, pt_weights_cp, dxf_cx, dxf_cy, dist_tex, W, H, "Huber", max_error_px)
     cost_polish = _make_cost_fn(dxf_c_cp, pt_weights_cp, dxf_cx, dxf_cy, dist_tex, W, H, "Welsch", max_error_px)
 
     # -- Step 5: Resolution-Independent Grid Sweep ---------------------
-    num_angles, num_gx, num_gy = 360, 21, 21
+    # CORRECTION 3 : Élargissement de la grille (41x41) et de la zone de recherche (20%)
+    num_angles, num_gx, num_gy = 360, 41, 41
     angles_cp = cp.linspace(-cp.pi, cp.pi, num_angles, endpoint=False, dtype=cp.float32)
-    search_range = diag * 0.05
+    search_range = diag * 0.20
     gx_cp = cp.linspace(-search_range, search_range, num_gx, dtype=cp.float32)
     gy_cp = cp.linspace(-search_range, search_range, num_gy, dtype=cp.float32)
 
@@ -326,10 +333,11 @@ def fit(
     costs_cp = cp.empty((num_gy, num_gx, num_angles), dtype=cp.float32)
     sweep_delta = max(10.0, diag * 0.01)
 
-    _k_fused_sweep((num_gx//8+1, num_gy//8+1, num_angles//4+1), (8, 8, 4),
-        (dist_tex, dxf_x_cp, dxf_y_cp, sweep_weights_cp, angles_cp, gx_cp, gy_cp, costs_cp,
-         W, H, len(dxf_x_cp), cp.float32(dxf_cx), cp.float32(dxf_cy), cp.float32(tx_init), cp.float32(ty_init),
-         cp.float32(sweep_delta), cp.float32(diag), num_gx, num_gy, num_angles))
+    _k_fused_sweep((num_gx // 8 + 1, num_gy // 8 + 1, num_angles // 4 + 1), (8, 8, 4),
+                   (dist_tex, dxf_x_cp, dxf_y_cp, sweep_weights_cp, angles_cp, gx_cp, gy_cp, costs_cp,
+                    W, H, len(dxf_x_cp), cp.float32(dxf_cx), cp.float32(dxf_cy), cp.float32(tx_init),
+                    cp.float32(ty_init),
+                    cp.float32(sweep_delta), cp.float32(diag), num_gx, num_gy, num_angles))
 
     # -- Step 6: Non-Maximum Suppression (NMS) & Candidates ------------
     costs_np = cp.asnumpy(costs_cp)
@@ -353,7 +361,7 @@ def fit(
 
         is_distinct = True
         for (ex, ey, et) in candidates:
-            dist_sq = (cx - ex)**2 + (cy - ey)**2
+            dist_sq = (cx - ex) ** 2 + (cy - ey) ** 2
             ang_diff = abs(ct - et)
             ang_diff = min(ang_diff, 2 * np.pi - ang_diff)
 
@@ -380,8 +388,10 @@ def fit(
     best_final_params = None
 
     for cand in candidates:
-        res_pull = minimize(cost_pull, np.array(cand), method="Powell", options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 20})
-        final_res = minimize(cost_polish, res_pull.x, method="Powell", options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 75})
+        res_pull = minimize(cost_pull, np.array(cand), method="Powell",
+                            options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 20})
+        final_res = minimize(cost_polish, res_pull.x, method="Powell",
+                             options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 75})
 
         if final_res.fun < best_final_cost:
             best_final_cost = final_res.fun
@@ -390,44 +400,54 @@ def fit(
     tx_opt, ty_opt, angle_opt = best_final_params
     inlier_frac = _compute_inlier_frac(polylines, best_final_params, dist_smooth_cp, dxf_cx, dxf_cy, max_error_px)
 
-    return FitResult(tx=float(tx_opt), ty=float(ty_opt), angle_deg=float(np.degrees(angle_opt)), cost=float(best_final_cost),
+    return FitResult(tx=float(tx_opt), ty=float(ty_opt), angle_deg=float(np.degrees(angle_opt)),
+                     cost=float(best_final_cost),
                      dxf_cx=dxf_cx, dxf_cy=dxf_cy, inlier_frac=inlier_frac, dist_t=cp.asnumpy(dist_smooth_cp),
                      dist_raw=distance_field.astype(np.float32))
 
 
-def _compute_inlier_frac(polylines: list[np.ndarray], params: np.ndarray, dist_t_cp: cp.ndarray, dxf_cx: float, dxf_cy: float, max_error_px: float) -> float:
+def _compute_inlier_frac(polylines: list[np.ndarray], params: np.ndarray, dist_t_cp: cp.ndarray, dxf_cx: float,
+                         dxf_cy: float, max_error_px: float) -> float:
     all_pts = _sample_polylines(polylines, spacing=1.0)
     if len(all_pts) == 0: return 0.0
     all_c_cp = cp.asarray(all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32), dtype=cp.float32)
     tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
     cos_t, sin_t = float(np.cos(angle)), float(np.sin(angle))
 
-    nx_cp, ny_cp = cos_t * all_c_cp[:, 0] - sin_t * all_c_cp[:, 1] + dxf_cx + tx, sin_t * all_c_cp[:, 0] + cos_t * all_c_cp[:, 1] + dxf_cy + ty
+    nx_cp, ny_cp = cos_t * all_c_cp[:, 0] - sin_t * all_c_cp[:, 1] + dxf_cx + tx, sin_t * all_c_cp[:,
+                                                                                          0] + cos_t * all_c_cp[:,
+                                                                                                       1] + dxf_cy + ty
     from cupyx.scipy.ndimage import map_coordinates as cp_map_coordinates
 
-    vals = cp_map_coordinates(dist_t_cp, cp.stack([ny_cp, nx_cp]), order=1, mode="constant", cval=float(max(dist_t_cp.shape)), prefilter=False)
+    vals = cp_map_coordinates(dist_t_cp, cp.stack([ny_cp, nx_cp]), order=1, mode="constant",
+                              cval=float(max(dist_t_cp.shape)), prefilter=False)
     return float(cp.mean(vals < max_error_px))
 
 
 # -- Utility Orchestrators ----------------------------------------------------
 
-def fit_complete(polylines_all: list[np.ndarray], polylines_refine: list[np.ndarray], edge_points: np.ndarray, silhouette_mask: np.ndarray | None = None, distance_field: np.ndarray | None = None, polylines_rot: list[np.ndarray] | None = None, polylines_pan: list[np.ndarray] | None = None, objective: str = "Tolerance", max_error_px: float = 1.0) -> FitResult:
+def fit_complete(polylines_all: list[np.ndarray], polylines_refine: list[np.ndarray], edge_points: np.ndarray,
+                 silhouette_mask: np.ndarray | None = None, distance_field: np.ndarray | None = None,
+                 polylines_rot: list[np.ndarray] | None = None, polylines_pan: list[np.ndarray] | None = None,
+                 objective: str = "Tolerance", max_error_px: float = 1.0) -> FitResult:
     res = fit(polylines_all, edge_points, silhouette_mask, distance_field, objective, max_error_px)
     dist_t_cp = cp.ascontiguousarray(cp.asarray(res.dist_t), dtype=cp.float32)
     params = np.array([res.tx, res.ty, np.radians(res.angle_deg)])
 
     if polylines_refine:
-        res_ref, _, _, _ = _refine_from(polylines_refine, params, dist_t_cp, n_sample=3000, max_error_px=max_error_px, dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy)
+        res_ref, _, _, _ = _refine_from(polylines_refine, params, dist_t_cp, n_sample=3000, max_error_px=max_error_px,
+                                        dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy)
         params = res_ref
 
     inlier = _compute_inlier_frac(polylines_all, params, dist_t_cp, res.dxf_cx, res.dxf_cy, max_error_px)
-    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost, dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)
+    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost,
+                     dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)
 
 
 def _refine_from(polylines, init_params, dist_t_cp, n_sample=3000, max_error_px=1.0, dxf_cx=None, dxf_cy=None) -> tuple:
     dxf_all = _sample_polylines(polylines, spacing=0.5)
     dxf_sample = _stride_subsample(dxf_all, n=n_sample)
-    if dxf_cx is None: dxf_cx, dxf_cy = dxf_all[:, 0].mean(), dxf_all[:, 1].mean()
+    if dxf_cx is None: dxf_cx, dxf_cy = float(dxf_all[:, 0].mean()), float(dxf_all[:, 1].mean())
 
     centroid = np.array([dxf_cx, dxf_cy], dtype=np.float32)
     dxf_c_cp = cp.asarray(dxf_sample - centroid, dtype=cp.float32)
@@ -437,7 +457,6 @@ def _refine_from(polylines, init_params, dist_t_cp, n_sample=3000, max_error_px=
     pt_weights[radii < radii.max() * 0.92] = 5.0
     pt_weights_cp = cp.asarray(pt_weights, dtype=cp.float32)
 
-    # Bind Texture memory for the utility refinements
     H, W = dist_t_cp.shape
     dist_tex = _create_texture_object(dist_t_cp)
 
@@ -446,7 +465,8 @@ def _refine_from(polylines, init_params, dist_t_cp, n_sample=3000, max_error_px=
     return res.x, res.fun, dxf_cx, dxf_cy
 
 
-def fit_poc(polylines_all, polylines_rot, polylines_pan, edge_points, silhouette_mask=None, distance_field=None, objective="Tolerance", max_error_px=1.0) -> FitResult:
+def fit_poc(polylines_all, polylines_rot, polylines_pan, edge_points, silhouette_mask=None, distance_field=None,
+            objective="Tolerance", max_error_px=1.0) -> FitResult:
     res = fit(polylines_all, edge_points, silhouette_mask, distance_field, objective, max_error_px)
     dist_t_cp = cp.ascontiguousarray(cp.asarray(res.dist_t), dtype=cp.float32)
     params = np.array([res.tx, res.ty, np.radians(res.angle_deg)])
@@ -462,9 +482,11 @@ def fit_poc(polylines_all, polylines_rot, polylines_pan, edge_points, silhouette
         H, W = dist_t_cp.shape
         dist_tex = _create_texture_object(dist_t_cp)
 
-        cost_fn = _make_cost_fn(dxf_c_cp, pt_w_cp, res.dxf_cx, res.dxf_cy, dist_tex, W, H, "Welsch", max_error_px, locked_theta=params[2])
+        cost_fn = _make_cost_fn(dxf_c_cp, pt_w_cp, res.dxf_cx, res.dxf_cy, dist_tex, W, H, "Welsch", max_error_px,
+                                locked_theta=params[2])
         res_pan = minimize(cost_fn, params[:2], method="Powell", options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 100})
         params[:2] = res_pan.x
 
     inlier = _compute_inlier_frac(polylines_all, params, dist_t_cp, res.dxf_cx, res.dxf_cy, max_error_px)
-    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost, dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)
+    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost,
+                     dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)

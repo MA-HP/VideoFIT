@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import socket
 
-CHANNEL_NAMES = {1: "EPI1", 2: "COAX", 3: "EPI2", 4: "DIA"}
+CHANNEL_NAMES = {1: "EPI", 2: "-", 3: "COAX", 4: "DIA"}
 
 
 class LightingService:
@@ -20,6 +20,12 @@ class LightingService:
     def set_intensity(self, channel: int, intensity: float) -> bool:
         intensity_str = f"{intensity:.2f}".rstrip("0").rstrip(".")
         return self._send(f"CH{channel},{intensity_str}\n")
+
+    def set_on(self, channel: int) -> bool:
+        return self._send(f"CH{channel},ON\n")
+
+    def set_off(self, channel: int) -> bool:
+        return self._send(f"CH{channel},OFF\n")
 
     def _send(self, command: str) -> bool:
         try:

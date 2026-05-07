@@ -76,17 +76,20 @@ class MetrologyWindow(QWidget):
         wa_layout.addWidget(self.viewer)
 
     def _build_floating_ui(self) -> None:
+        BTN_SIZE = 45
+        ICON_SIZE = BTN_SIZE  # pixmap fills the button exactly; margin is baked into the pixmap
+
         self.btn_settings = QPushButton(self._work_area)
-        self.btn_settings.setIcon(IconManager.get_icon("settings", "⚙️"))
-        self.btn_settings.setIconSize(QSize(24, 24))
-        self.btn_settings.setFixedSize(45, 45)
+        self.btn_settings.setIcon(IconManager.get_icon("settings", "⚙️", size=ICON_SIZE, inset_factor=0.25))
+        self.btn_settings.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
+        self.btn_settings.setFixedSize(BTN_SIZE, BTN_SIZE)
         self.btn_settings.setCheckable(True)
         self.btn_settings.setStyleSheet(SETTINGS_BTN_STYLE)
 
         self.btn_lighting = QPushButton(self._work_area)
-        self.btn_lighting.setIcon(IconManager.get_icon("light", "💡"))
-        self.btn_settings.setIconSize(QSize(24, 24))
-        self.btn_lighting.setFixedSize(45, 45)
+        self.btn_lighting.setIcon(IconManager.get_icon("light", "💡", size=ICON_SIZE, inset_factor=0.25))
+        self.btn_lighting.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
+        self.btn_lighting.setFixedSize(BTN_SIZE, BTN_SIZE)
         self.btn_lighting.setCheckable(True)
         self.btn_lighting.setStyleSheet(SETTINGS_BTN_STYLE)
 

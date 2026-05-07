@@ -20,23 +20,27 @@ from app.views.lighting_panel import LightingPanel
 class _LightingWorker:
     """
     Single daemon thread that serialises every TCP command.
-
-    send(channel, value) overwrites any pending value for that channel.
-    The thread drains the pending dict one command at a time — so during
-    a burst (e.g. slider drag) intermediate values are dropped and only
-    the latest per channel is ever transmitted.
+    Pending dict maps channel → ('intensity', value) or ('on'/'off', None).
+    ON/OFF always overrides any pending intensity for that channel.
     """
 
     def __init__(self, service: LightingService) -> None:
         self._service = service
-        self._pending: dict[int, float] = {}   # channel → latest value
+        self._pending: dict[int, tuple[str, float | None]] = {}
         self._lock = threading.Lock()
         self._event = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
-    def send(self, channel: int, value: float) -> None:
+    def send_intensity(self, channel: int, value: float) -> None:
         with self._lock:
-            self._pending[channel] = value     # overwrite — only latest matters
+            # Don't overwrite a pending ON/OFF with an intensity
+            if channel not in self._pending or self._pending[channel][0] == "intensity":
+                self._pending[channel] = ("intensity", value)
+        self._event.set()
+
+    def send_on_off(self, channel: int, on: bool) -> None:
+        with self._lock:
+            self._pending[channel] = ("on" if on else "off", None)
         self._event.set()
 
     def _run(self) -> None:
@@ -48,12 +52,15 @@ class _LightingWorker:
                 with self._lock:
                     if not self._pending:
                         break
-                    # Pop one channel to send (FIFO on insertion order)
-                    channel, value = next(iter(self._pending.items()))
+                    channel, (kind, value) = next(iter(self._pending.items()))
                     del self._pending[channel]
 
-                # TCP call outside the lock so new send() can arrive freely
-                self._service.set_intensity(channel, value)
+                if kind == "intensity":
+                    self._service.set_intensity(channel, value)
+                elif kind == "on":
+                    self._service.set_on(channel)
+                else:
+                    self._service.set_off(channel)
 
 
 class LightingPresenter(QObject):
@@ -83,6 +90,7 @@ class LightingPresenter(QObject):
 
         self._toggle_btn.clicked.connect(self._on_toggle)
         self._panel.intensity_changed.connect(self._on_intensity_changed)
+        self._panel.channel_toggled.connect(self._on_channel_toggled)
 
     # ------------------------------------------------------------------
 
@@ -112,6 +120,7 @@ class LightingPresenter(QObject):
         self._panel._active_channels = active_channels
         self._panel._sliders.clear()
         self._panel._value_labels.clear()
+        self._panel._toggle_btns.clear()
         old_layout = self._panel.layout()
         if old_layout:
             while old_layout.count():
@@ -131,11 +140,16 @@ class LightingPresenter(QObject):
             (4, cam.light_ch4_intensity),
         ]:
             self._panel.set_channel_intensity(ch, val)
+            self._panel.set_channel_on(ch, True)   # always restore ON on preset load
             if send:
-                self._worker.send(ch, val)
+                self._worker.send_intensity(ch, val)
 
     def _on_toggle(self) -> None:
         self._panel.setVisible(self._toggle_btn.isChecked())
 
     def _on_intensity_changed(self, channel: int, intensity: float) -> None:
-        self._worker.send(channel, intensity)
+        self._worker.send_intensity(channel, intensity)
+
+    def _on_channel_toggled(self, channel: int, on: bool) -> None:
+        self._worker.send_on_off(channel, on)
+

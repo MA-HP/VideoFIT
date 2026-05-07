@@ -15,7 +15,7 @@ class IconManager:
     Rasterise SVG into a QPixmap of the requested size (handles high-DPI)."""
 
     @staticmethod
-    def get_icon(name: str, fallback_text: str, size: int = 64) -> QIcon:
+    def get_icon(name: str, fallback_text: str, size: int = 64, inset_factor: float = 0.0) -> QIcon:
         path = f"icons/{name}.svg"
 
         # get device pixel ratio for high-DPI screens
@@ -23,7 +23,7 @@ class IconManager:
         dpr = float(screen.devicePixelRatio()) if screen else 1.0
 
         # content tuning
-        Y_OFFSET_FACTOR = 0.1  # move content down by this fraction of the pixmap height
+        Y_OFFSET_FACTOR = 0.0  # no vertical offset — keep icons perfectly centered
         RIGHT_PADDING_FACTOR = 0  # leave some space at the right of the icon
 
         # logical (device-independent) size and physical size
@@ -53,19 +53,23 @@ class IconManager:
                 available_h = max(1, logical_h - y_offset)
 
                 svg_size = renderer.defaultSize()
+                # bake margin into pixmap using inset_factor
+                inset = int(logical_w * inset_factor)
+                draw_size = max(1, logical_w - 2 * inset)
+
                 if svg_size.width() > 0 and svg_size.height() > 0:
                     svg_w = svg_size.width()
                     svg_h = svg_size.height()
-                    scale = min(available_w / svg_w, available_h / svg_h)
+                    scale = min(draw_size / svg_w, draw_size / svg_h)
                     target_w = max(1, int(svg_w * scale))
                     target_h = max(1, int(svg_h * scale))
                 else:
-                    target_w = available_w
-                    target_h = available_h
+                    target_w = draw_size
+                    target_h = draw_size
 
-                # center the rendered SVG inside the available area, apply vertical offset
-                x = (available_w - target_w) // 2
-                y = y_offset + (available_h - target_h) // 2
+                # mathematically centered in the pixmap
+                x = (logical_w - target_w) // 2
+                y = (logical_h - target_h) // 2
                 render_rect = QRect(x, y, target_w, target_h)
 
                 renderer.render(painter, render_rect)
