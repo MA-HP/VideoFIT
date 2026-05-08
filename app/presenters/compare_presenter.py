@@ -86,7 +86,7 @@ class _FitWorker(QRunnable):
                     objective=self.objective,
                     max_error_px=self.max_error_px,
                 )
-            self.signals.finished.emit((result, stages) if self.debug else result)
+            self.signals.finished.emit((result, stages, edge_result, self.frame_bgr) if self.debug else result)
         except Exception as exc:
             import traceback
             self.signals.error.emit(traceback.format_exc())
@@ -200,11 +200,11 @@ class ComparePresenter(QObject):
 
     @Slot(object)
     def _on_fit_done(self, payload) -> None:
-        # payload is FitResult (normal) or (FitResult, stages_dict) in debug mode
+        # payload is FitResult (normal) or (FitResult, stages_dict, EdgeResult, frame_bgr) in debug mode
         if isinstance(payload, tuple):
-            result, stages = payload
+            result, stages, edge_result, frame_bgr = payload
         else:
-            result, stages = payload, None
+            result, stages, edge_result, frame_bgr = payload, None, None, None
 
         fit_info = (f"tx={result.tx:+.2f}  ty={result.ty:+.2f}  "
                     f"angle={result.angle_deg:.2f}°  cost={result.cost:.2f}  "
@@ -224,7 +224,15 @@ class ComparePresenter(QObject):
 
         # Update debug window if stages were captured
         if stages is not None and self._debug_window is not None:
-            self._debug_window.update_stages(stages, fit_info=fit_info)
+            self._debug_window.update_stages(
+                stages,
+                fit_info=fit_info,
+                fit_result=result,
+                edge_result=edge_result,
+                dxf_data=self._dxf_data,
+                px_per_mm=px_per_mm,
+                frame_bgr=frame_bgr,
+            )
 
         self._toolbar.btn_run_compare.setEnabled(True)
         self._toolbar.btn_run_compare.setText(" Run")
