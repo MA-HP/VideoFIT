@@ -181,10 +181,12 @@ class Toolbar(QWidget):
         # Compare page
         compare_page, compare_btns = _make_tool_page([
             (" Load", "loadfile", "📄"),
-            (" Run", "run", "▶️"),
+            (" Fit", "crosshair", "▶️"),
+            (" Reanalyze", "refresh", "🔄"),
         ], return_buttons=True)
         self.btn_load = compare_btns[0]
-        self.btn_run_compare = compare_btns[1]
+        self.btn_fit = compare_btns[1]
+        self.btn_reanalyze = compare_btns[2]
         self.tool_stack.addWidget(compare_page)
 
         bottom_layout.addWidget(self.tool_stack)
