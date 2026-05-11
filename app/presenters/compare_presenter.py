@@ -28,7 +28,7 @@ from app.views.toolbar import Toolbar
 
 class _FitSignals(QObject):
     """Signals emitted by the background fitting worker."""
-    finished = Signal(object)   # FitResult or (FitResult, stages_dict)
+    finished = Signal(object)   # (FitResult, rgba_bytes, shape) or (FitResult, rgba_bytes, shape, stages, edge_result, frame_bgr)
     error = Signal(str)
 
 
@@ -36,7 +36,10 @@ class _FitWorker(QRunnable):
     """Runs the heavy edge-detection + fitting pipeline off the UI thread."""
 
     def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf, debug: bool = False,
-                 mode: str = "Best Fit", objective: str = "Strict", max_error_px: float = 2.0) -> None:
+                 mode: str = "Best Fit", objective: str = "Strict", max_error_px: float = 2.0,
+                 heatmap_min: float = 1.0, heatmap_max: float = 3.0,
+                 color_low: str = "#00FF00", color_mid: str = "#FF8000",
+                 color_high: str = "#FF0000") -> None:
         super().__init__()
         self.frame_bgr = frame_bgr
         self.dxf_data = dxf_data
@@ -44,11 +47,15 @@ class _FitWorker(QRunnable):
         self.mode = mode
         self.objective = objective
         self.max_error_px = max_error_px
+        self.heatmap_min = heatmap_min
+        self.heatmap_max = heatmap_max
+        self.color_low = color_low
+        self.color_mid = color_mid
+        self.color_high = color_high
         self.signals = _FitSignals()
 
     def run(self) -> None:
         try:
-            # Edge detection (expects BGR)
             if self.debug:
                 edge_result, stages = compute_edges(self.frame_bgr, capture_stages=True)
             else:
@@ -87,8 +94,23 @@ class _FitWorker(QRunnable):
                     objective=self.objective,
                     max_error_px=self.max_error_px,
                 )
-            self.signals.finished.emit((result, stages, edge_result, self.frame_bgr) if self.debug else result)
-        except Exception as exc:
+
+            # Compute RGBA heatmap here on the worker thread (pure numpy, no Qt)
+            # so the main thread only does lightweight Qt brush/scene operations.
+            rgba_bytes, shape = DxfOverlay.compute_heatmap_rgba(
+                result,
+                heatmap_min=self.heatmap_min,
+                heatmap_max=self.heatmap_max,
+                color_low=self.color_low,
+                color_mid=self.color_mid,
+                color_high=self.color_high,
+            )
+
+            if self.debug:
+                self.signals.finished.emit((result, rgba_bytes, shape, stages, edge_result, self.frame_bgr))
+            else:
+                self.signals.finished.emit((result, rgba_bytes, shape))
+        except Exception:
             import traceback
             self.signals.error.emit(traceback.format_exc())
 
@@ -98,13 +120,21 @@ class _ReanalyzeWorker(QRunnable):
     using the *existing* fit transform (no re-fitting)."""
 
     def __init__(self, frame_bgr: np.ndarray, dxf_data: Dxf, prev_result: FitResult,
-                 debug: bool = False, max_error_px: float = 2.0) -> None:
+                 debug: bool = False, max_error_px: float = 2.0,
+                 heatmap_min: float = 1.0, heatmap_max: float = 3.0,
+                 color_low: str = "#00FF00", color_mid: str = "#FF8000",
+                 color_high: str = "#FF0000") -> None:
         super().__init__()
         self.frame_bgr = frame_bgr
         self.dxf_data = dxf_data
         self.prev_result = prev_result
         self.debug = debug
         self.max_error_px = max_error_px
+        self.heatmap_min = heatmap_min
+        self.heatmap_max = heatmap_max
+        self.color_low = color_low
+        self.color_mid = color_mid
+        self.color_high = color_high
         self.signals = _FitSignals()
 
     def run(self) -> None:
@@ -115,8 +145,6 @@ class _ReanalyzeWorker(QRunnable):
                 edge_result = compute_edges(self.frame_bgr)
                 stages = None
 
-            # Build a new FitResult keeping the same transform but with the
-            # fresh distance fields from the new edge detection.
             r = self.prev_result
             new_result = FitResult(
                 tx=r.tx, ty=r.ty, angle_deg=r.angle_deg,
@@ -125,10 +153,21 @@ class _ReanalyzeWorker(QRunnable):
                 dist_t=edge_result.distance_field,
                 dist_raw=edge_result.distance_field,
             )
+
+            # Compute RGBA on the worker thread (pure numpy)
+            rgba_bytes, shape = DxfOverlay.compute_heatmap_rgba(
+                new_result,
+                heatmap_min=self.heatmap_min,
+                heatmap_max=self.heatmap_max,
+                color_low=self.color_low,
+                color_mid=self.color_mid,
+                color_high=self.color_high,
+            )
+
             if self.debug:
-                self.signals.finished.emit((new_result, stages, edge_result, self.frame_bgr))
+                self.signals.finished.emit((new_result, rgba_bytes, shape, stages, edge_result, self.frame_bgr))
             else:
-                self.signals.finished.emit(new_result)
+                self.signals.finished.emit((new_result, rgba_bytes, shape))
         except Exception:
             import traceback
             self.signals.error.emit(traceback.format_exc())
@@ -233,8 +272,16 @@ class ComparePresenter(QObject):
         objective = self._settings_panel.combo_fit_objective.currentText()
         px_per_mm = self._active_calibration()
         max_error_px = self._active_heatmap_max() * px_per_mm if px_per_mm > 0 else 2.0
-        worker = _FitWorker(frame_bgr.copy(), self._dxf_data, debug=debug, mode=mode,
-                            objective=objective, max_error_px=max_error_px)
+        heatmap_min = self._active_heatmap_min() * px_per_mm
+        heatmap_max = self._active_heatmap_max() * px_per_mm
+        worker = _FitWorker(
+            frame_bgr.copy(), self._dxf_data, debug=debug, mode=mode,
+            objective=objective, max_error_px=max_error_px,
+            heatmap_min=heatmap_min, heatmap_max=heatmap_max,
+            color_low=self._settings.app_defaults.heatmap_color_low,
+            color_mid=self._settings.app_defaults.heatmap_color_mid,
+            color_high=self._settings.app_defaults.heatmap_color_high,
+        )
         worker.signals.finished.connect(self._on_fit_done, Qt.DirectConnection)
         worker.signals.error.connect(self._on_fit_error, Qt.DirectConnection)
         worker.setAutoDelete(True)
@@ -244,40 +291,27 @@ class ComparePresenter(QObject):
 
     @Slot(object)
     def _on_fit_done(self, payload) -> None:
-        # payload is FitResult (normal) or (FitResult, stages_dict, EdgeResult, frame_bgr) in debug mode
-        if isinstance(payload, tuple):
-            result, stages, edge_result, frame_bgr = payload
+        # payload: (result, rgba_bytes, shape) or (result, rgba_bytes, shape, stages, edge_result, frame_bgr)
+        if len(payload) == 6:
+            result, rgba_bytes, shape, stages, edge_result, frame_bgr = payload
         else:
-            result, stages, edge_result, frame_bgr = payload, None, None, None
+            result, rgba_bytes, shape = payload
+            stages, edge_result, frame_bgr = None, None, None
 
         fit_info = (f"tx={result.tx:+.2f}  ty={result.ty:+.2f}  "
                     f"angle={result.angle_deg:.2f}°  cost={result.cost:.2f}  "
                     f"inlier={result.inlier_frac * 100:.2f}%")
         print(f"Fit complete — {fit_info}")
-
         self._last_result = result
 
-        px_per_mm = self._dxf_data.px_per_mm
-        self._overlay.draw_heatmap(
-            self._dxf_data,
-            result,
-            heatmap_min=self._active_heatmap_min() * px_per_mm,
-            heatmap_max=self._active_heatmap_max() * px_per_mm,
-            color_low=self._settings.app_defaults.heatmap_color_low,
-            color_mid=self._settings.app_defaults.heatmap_color_mid,
-            color_high=self._settings.app_defaults.heatmap_color_high,
-        )
+        # Qt-only ops (no numpy) — fast on main thread
+        self._overlay.draw_heatmap_from_rgba(self._dxf_data, result, rgba_bytes, shape)
 
-        # Update debug window if stages were captured
         if stages is not None and self._debug_window is not None:
             self._debug_window.update_stages(
-                stages,
-                fit_info=fit_info,
-                fit_result=result,
-                edge_result=edge_result,
-                dxf_data=self._dxf_data,
-                px_per_mm=px_per_mm,
-                frame_bgr=frame_bgr,
+                stages, fit_info=fit_info, fit_result=result,
+                edge_result=edge_result, dxf_data=self._dxf_data,
+                px_per_mm=self._dxf_data.px_per_mm, frame_bgr=frame_bgr,
             )
 
         self._toolbar.btn_fit.setEnabled(True)
@@ -315,10 +349,17 @@ class ComparePresenter(QObject):
                  and self._settings_panel.chk_debug.isChecked())
         px_per_mm = self._active_calibration()
         max_error_px = self._active_heatmap_max() * px_per_mm if px_per_mm > 0 else 2.0
+        heatmap_min = self._active_heatmap_min() * px_per_mm
+        heatmap_max = self._active_heatmap_max() * px_per_mm
 
-        worker = _ReanalyzeWorker(frame_bgr.copy(), self._dxf_data,
-                                  self._last_result, debug=debug,
-                                  max_error_px=max_error_px)
+        worker = _ReanalyzeWorker(
+            frame_bgr.copy(), self._dxf_data, self._last_result,
+            debug=debug, max_error_px=max_error_px,
+            heatmap_min=heatmap_min, heatmap_max=heatmap_max,
+            color_low=self._settings.app_defaults.heatmap_color_low,
+            color_mid=self._settings.app_defaults.heatmap_color_mid,
+            color_high=self._settings.app_defaults.heatmap_color_high,
+        )
         worker.signals.finished.connect(self._on_reanalyze_done, Qt.DirectConnection)
         worker.signals.error.connect(self._on_reanalyze_error, Qt.DirectConnection)
         worker.setAutoDelete(True)
@@ -326,35 +367,28 @@ class ComparePresenter(QObject):
 
     @Slot(object)
     def _on_reanalyze_done(self, payload) -> None:
-        if isinstance(payload, tuple):
-            result, stages, edge_result, frame_bgr = payload
+        if len(payload) == 6:
+            result, rgba_bytes, shape, stages, edge_result, frame_bgr = payload
         else:
-            result, stages, edge_result, frame_bgr = payload, None, None, None
+            result, rgba_bytes, shape = payload
+            stages, edge_result, frame_bgr = None, None, None
 
         print("Re-analysis complete — heatmap updated with new edge data, same alignment.")
-
         self._last_result = result
-        px_per_mm = self._dxf_data.px_per_mm
-        self._overlay.draw_heatmap(
-            self._dxf_data,
-            result,
-            heatmap_min=self._active_heatmap_min() * px_per_mm,
-            heatmap_max=self._active_heatmap_max() * px_per_mm,
-            color_low=self._settings.app_defaults.heatmap_color_low,
-            color_mid=self._settings.app_defaults.heatmap_color_mid,
-            color_high=self._settings.app_defaults.heatmap_color_high,
-        )
+
+        # Qt-only — fast
+        self._overlay.draw_heatmap_from_rgba(self._dxf_data, result, rgba_bytes, shape)
 
         if stages is not None and self._debug_window is not None:
             self._debug_window.update_stages(
                 stages, fit_info="Re-analysis (same transform)",
                 fit_result=result, edge_result=edge_result,
-                dxf_data=self._dxf_data, px_per_mm=px_per_mm,
+                dxf_data=self._dxf_data, px_per_mm=self._dxf_data.px_per_mm,
                 frame_bgr=frame_bgr,
             )
 
         self._toolbar.btn_reanalyze.setEnabled(True)
-        self._toolbar.btn_reanalyze.setText(" Reanalyse")
+        self._toolbar.btn_reanalyze.setText(" Reanalyze")
 
     @Slot(str)
     def _on_reanalyze_error(self, msg: str) -> None:
