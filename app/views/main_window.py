@@ -22,12 +22,13 @@ class MetrologyWindow(QWidget):
     all behaviour to presenters wired by the orchestrator.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, toolbar_mode: str = "App") -> None:
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(1100, 800)
 
+        self._toolbar_mode = toolbar_mode
         self._build_shell()
         self._build_floating_ui()
 
@@ -95,7 +96,7 @@ class MetrologyWindow(QWidget):
 
         self.settings_panel = SettingsPanel(self._work_area)
         self.lighting_panel = LightingPanel(parent=self._work_area)  # channels set later by presenter
-        self.toolbar = Toolbar(self._work_area)
+        self.toolbar = Toolbar(mode=self._toolbar_mode, parent=self._work_area)
 
         self._size_grip = QSizeGrip(self._container)
         self._size_grip.setStyleSheet("background-color: transparent;")

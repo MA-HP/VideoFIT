@@ -1,0 +1,42 @@
+{
+  "trigger": "movement",
+  "stabilization_frames": 5,
+  "movement_threshold": 0.5,
+  "stability_threshold": 0.05,
+  "noise_px_threshold": 25,
+  "morph_kernel_size": 15,
+  "pipeline": [
+    {
+      "action": "lighting",
+      "params": {
+        "EPI": 0,
+        "COAX": 0,
+        "DIA": 2
+      }
+    },
+    {
+      "action": "compare",
+      "params": {
+        "task": "Fit",
+        "mode": "Refine",
+        "objective": "Strict",
+        "dxf_file": "C:/Users/hp/Downloads/refine_exemple_2.dxf"
+      }
+    },
+    {
+      "action": "lighting",
+      "params": {
+        "EPI": 90,
+        "COAX": 0,
+        "DIA": 2
+      }
+    },
+    {
+      "action": "compare",
+      "params": {
+        "task": "Reanalyze"
+      }
+    }
+  ]
+}
+

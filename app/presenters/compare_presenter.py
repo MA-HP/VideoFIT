@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
 from PySide6.QtWidgets import QFileDialog
 
 from app.models.dxf import Dxf
@@ -235,8 +235,8 @@ class ComparePresenter(QObject):
         max_error_px = self._active_heatmap_max() * px_per_mm if px_per_mm > 0 else 2.0
         worker = _FitWorker(frame_bgr.copy(), self._dxf_data, debug=debug, mode=mode,
                             objective=objective, max_error_px=max_error_px)
-        worker.signals.finished.connect(self._on_fit_done)
-        worker.signals.error.connect(self._on_fit_error)
+        worker.signals.finished.connect(self._on_fit_done, Qt.DirectConnection)
+        worker.signals.error.connect(self._on_fit_error, Qt.DirectConnection)
         worker.setAutoDelete(True)
         self._pool.start(worker)
 
@@ -319,8 +319,8 @@ class ComparePresenter(QObject):
         worker = _ReanalyzeWorker(frame_bgr.copy(), self._dxf_data,
                                   self._last_result, debug=debug,
                                   max_error_px=max_error_px)
-        worker.signals.finished.connect(self._on_reanalyze_done)
-        worker.signals.error.connect(self._on_reanalyze_error)
+        worker.signals.finished.connect(self._on_reanalyze_done, Qt.DirectConnection)
+        worker.signals.error.connect(self._on_reanalyze_error, Qt.DirectConnection)
         worker.setAutoDelete(True)
         self._pool.start(worker)
 

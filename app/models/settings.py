@@ -34,6 +34,7 @@ class AppDefaults:
     heatmap_color_low: str = "#00FF00"
     heatmap_color_mid: str = "#FF8000"
     heatmap_color_high: str = "#FF0000"
+    mode: str = "App"   # "App" = normal Measure/Compare UI  |  "Auto" = automated pipeline
     # Which channels are active by default
     light_ch1_active: bool = True
     light_ch2_active: bool = False
@@ -68,6 +69,7 @@ class AppSettings:
                 heatmap_color_low=defaults_raw.get("heatmap_color_low", "#00FF00"),
                 heatmap_color_mid=defaults_raw.get("heatmap_color_mid", "#FF8000"),
                 heatmap_color_high=defaults_raw.get("heatmap_color_high", "#FF0000"),
+                mode=defaults_raw.get("mode", "App"),
                 light_ch1_active=bool(defaults_raw.get("light_ch1_active", True)),
                 light_ch2_active=bool(defaults_raw.get("light_ch2_active", False)),
                 light_ch3_active=bool(defaults_raw.get("light_ch3_active", True)),
