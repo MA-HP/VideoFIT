@@ -273,7 +273,8 @@ def fit(
     dxf_sample = _stride_subsample(dxf_all, n=3000)
 
     # CORRECTION 1 : Utilisation de la moyenne des points comme proxy du centre de masse
-    dxf_cx, dxf_cy = float(dxf_all[:, 0].mean()), float(dxf_all[:, 1].mean())
+    dxf_cx = float((dxf_all[:, 0].min() + dxf_all[:, 0].max()) / 2.0)
+    dxf_cy = float((dxf_all[:, 1].min() + dxf_all[:, 1].max()) / 2.0)
 
     # -- Step 3: Mass-Locked Centroids ---------------------------------
     # CORRECTION 2 : Utilisation des moments pour trouver le vrai centre de la forme
@@ -315,7 +316,7 @@ def fit(
 
     # -- Step 5: Resolution-Independent Grid Sweep ---------------------
     # CORRECTION 3 : Élargissement de la grille (41x41) et de la zone de recherche (20%)
-    num_angles, num_gx, num_gy = 360, 41, 41
+    num_angles, num_gx, num_gy = 270, 5, 5
     angles_cp = cp.linspace(-cp.pi, cp.pi, num_angles, endpoint=False, dtype=cp.float32)
     search_range = diag * 0.20
     gx_cp = cp.linspace(-search_range, search_range, num_gx, dtype=cp.float32)

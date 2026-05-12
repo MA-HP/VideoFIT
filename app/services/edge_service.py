@@ -309,14 +309,7 @@ def compute_edges(
             viz_cp[ys_render, xs_render] = 255
         stages["edge_points_viz"] = cp.asnumpy(viz_cp)
 
-    # ── Step 12: Centroid from coordinate-wise median (GPU) ─────────────────
-    if len(edge_points_cp) > 0:
-        cx = float(cp.median(xs_cp))
-        cy = float(cp.median(ys_cp))
-    else:
-        cx, cy = W / 2.0, H / 2.0
-
-    # ── Step 13: Distance Transform (GPU) ───────────────────────────────────
+    # ── Step 12: Distance Transform (GPU) ───────────────────────────────────
     if len(edge_points_cp) > 0:
         dist_input = edge_map_cp == 0
         dist_cp = distance_transform_edt(dist_input).astype(cp.float32)
@@ -325,6 +318,33 @@ def compute_edges(
 
     if capture_stages:
         stages["distance_field"] = cp.asnumpy(dist_cp)
+
+    # ── Step 13: Centroid = distance-field weighted moment (inside edge bbox) ─
+    # Weight = dist^4 strongly concentrates mass on the part interior while
+    # suppressing spurious edge pixels.  Using the full moment (not argmax)
+    # avoids flying off to an isolated peak in a corner.
+    # Works with outer contour visible OR inner holes/features only.
+    if len(edge_points_cp) > 0:
+        margin = 50
+        x_min = int(max(0,     cp.min(xs_cp).item() - margin))
+        x_max = int(min(W - 1, cp.max(xs_cp).item() + margin))
+        y_min = int(max(0,     cp.min(ys_cp).item() - margin))
+        y_max = int(min(H - 1, cp.max(ys_cp).item() + margin))
+
+        roi = dist_cp[y_min:y_max + 1, x_min:x_max + 1]   # (rH, rW)
+
+        # dist^4 → strongly favours the part body over edges/background
+        w = roi ** 4
+        w_sum = float(cp.sum(w)) + 1e-8
+
+        rH, rW = roi.shape
+        col_idx = cp.arange(rW, dtype=cp.float32)[None, :]  # (1, rW)
+        row_idx = cp.arange(rH, dtype=cp.float32)[:, None]  # (rH, 1)
+
+        cx = float(cp.sum(w * col_idx) / w_sum) + x_min
+        cy = float(cp.sum(w * row_idx) / w_sum) + y_min
+    else:
+        cx, cy = W / 2.0, H / 2.0
 
     # ── Step 14: Final PCIe Download ────────────────────────────────────────
     # The arrays are downloaded only once, right at the end.
