@@ -200,6 +200,7 @@ class ComparePresenter(QObject):
         self._overlay = DxfOverlay(self._viewer._scene)
         self._pool = QThreadPool.globalInstance()
         self._debug_window = DebugPreprocessingWindow() if debug else None
+        self._active_signals = None  # prevent GC of worker signals before queued delivery
 
         # Wire toolbar buttons
         self._toolbar.btn_load.clicked.connect(self._on_load)
@@ -282,8 +283,9 @@ class ComparePresenter(QObject):
             color_mid=self._settings.app_defaults.heatmap_color_mid,
             color_high=self._settings.app_defaults.heatmap_color_high,
         )
-        worker.signals.finished.connect(self._on_fit_done, Qt.DirectConnection)
-        worker.signals.error.connect(self._on_fit_error, Qt.DirectConnection)
+        worker.signals.finished.connect(self._on_fit_done, Qt.QueuedConnection)
+        worker.signals.error.connect(self._on_fit_error, Qt.QueuedConnection)
+        self._active_signals = worker.signals  # prevent GC before queued delivery
         worker.setAutoDelete(True)
         self._pool.start(worker)
 
@@ -360,8 +362,9 @@ class ComparePresenter(QObject):
             color_mid=self._settings.app_defaults.heatmap_color_mid,
             color_high=self._settings.app_defaults.heatmap_color_high,
         )
-        worker.signals.finished.connect(self._on_reanalyze_done, Qt.DirectConnection)
-        worker.signals.error.connect(self._on_reanalyze_error, Qt.DirectConnection)
+        worker.signals.finished.connect(self._on_reanalyze_done, Qt.QueuedConnection)
+        worker.signals.error.connect(self._on_reanalyze_error, Qt.QueuedConnection)
+        self._active_signals = worker.signals  # prevent GC before queued delivery
         worker.setAutoDelete(True)
         self._pool.start(worker)
 
