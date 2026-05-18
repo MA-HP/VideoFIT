@@ -1,7 +1,7 @@
 """
 VideoFIT — DXF Service
 Business logic for loading and parsing DXF files into pixel-space polylines.
-The DxfData dataclass (pure structure) lives in app.models.dxf_model.
+This module strictly handles I/O and spatial translation of CAD data.
 """
 
 from __future__ import annotations
@@ -20,31 +20,13 @@ def load_dxf(
 ) -> Dxf:
     """
     Parse *filepath* and return pixel-space polylines centred on the canvas.
-
-    Parameters
-    ----------
-    filepath : str
-        Path to the .dxf file.
-    px_per_mm : float
-        Camera calibration (pixels per millimetre).
-    canvas_shape : (H, W)
-        Size of the target image in pixels.
-
-    Returns
-    -------
-    Dxf
-        Dataclass holding pixel-space polylines and the DXF bounding-box centre.
     """
     doc = ezdxf.readfile(filepath)
     msp = doc.modelspace()
 
     # ── Step 1: Extract geometry per entity ───────────────────────────
-    # Each DXF entity (LINE, ARC, SPLINE, CIRCLE, LWPOLYLINE…) becomes its own
-    # polyline. We do NOT chain/merge adjacent segments — preserving entity
-    # boundaries is crucial for "points of interest" in Refine mode and gives
-    # the optimizer many more independently-shaped features to lock onto.
     raw_polylines_mm: list[np.ndarray] = []
-    raw_layers: list[str] = []   # layer name per polyline (upper-cased)
+    raw_layers: list[str] = []
 
     def iter_all_entities(layout):
         for e in layout:
@@ -87,11 +69,13 @@ def load_dxf(
     polylines_refine: list[np.ndarray] = []
     polylines_rot: list[np.ndarray] = []
     polylines_pan: list[np.ndarray] = []
+
     for i, poly_mm in enumerate(raw_polylines_mm):
         x_px = canvas_cx + (poly_mm[:, 0] - dxf_cx) * px_per_mm
         y_px = canvas_cy - (poly_mm[:, 1] - dxf_cy) * px_per_mm  # Y-flip
         poly_px = np.column_stack([x_px, y_px]).astype(np.float32)
         polylines.append(poly_px)
+
         layer = raw_layers[i]
         if layer == "REFINE":
             polylines_refine.append(poly_px)

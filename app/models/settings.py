@@ -40,6 +40,11 @@ class AppDefaults:
     light_ch2_active: bool = False
     light_ch3_active: bool = True
     light_ch4_active: bool = True
+    # Channel display names
+    light_ch1_name: str = "EPI"
+    light_ch2_name: str = "-"
+    light_ch3_name: str = "COAX"
+    light_ch4_name: str = "DIA"
     # Lighting controller network settings
     lighting_ip: str = "169.254.5.100"
     lighting_port: int = 62077
@@ -74,6 +79,10 @@ class AppSettings:
                 light_ch2_active=bool(defaults_raw.get("light_ch2_active", False)),
                 light_ch3_active=bool(defaults_raw.get("light_ch3_active", True)),
                 light_ch4_active=bool(defaults_raw.get("light_ch4_active", True)),
+                light_ch1_name=defaults_raw.get("light_ch1_name", "EPI"),
+                light_ch2_name=defaults_raw.get("light_ch2_name", "-"),
+                light_ch3_name=defaults_raw.get("light_ch3_name", "COAX"),
+                light_ch4_name=defaults_raw.get("light_ch4_name", "DIA"),
                 lighting_ip=defaults_raw.get("lighting_ip", "169.254.5.100"),
                 lighting_port=int(defaults_raw.get("lighting_port", 62077)),
             )

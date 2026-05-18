@@ -1,24 +1,6 @@
 """
 VideoFIT — Edge Service (Fused & Optimized)
 GPU edge pipeline, no spatial mask.
-
-The pipeline runs a custom Devernay implementation on the full grayscale
-frame with strict gradient / length / curvature thresholds.
-By fusing the Devernay logic directly into the Edge Service, we completely
-eliminate the PCIe roundtrips (uploading/downloading arrays) between
-the edge extraction and the post-processing steps.
-
-Benefits over the mask-based approach:
-──────────────────────────────────────
-• Zero sensitivity to illumination mode (DIA / EPI / DIA+EPI).
-• No morphological overhead (Gaussian blur → Otsu → flood-fill → erode
-  / dilate) — saves ~10–20 ms per frame.
-• No mask failure modes (part touching border, unusual reflectivity …)[cite: 1].
-• Centroid from edge-point median is more stable than mask moments for
-  non-convex or partially-occluded parts[cite: 1].
-
-Hysteresis runs on the CPU with OpenCV connected-components (faster than
-CuPy ndi.label for typical frame sizes due to lower kernel-launch overhead).
 """
 
 from __future__ import annotations
@@ -29,7 +11,6 @@ import cupy as cp
 from cupyx.scipy.ndimage import distance_transform_edt
 
 from app.models.edge_result import EdgeResult
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CUDA Kernels (compiled once at import time)
@@ -150,7 +131,6 @@ _k_bilateral = cp.RawKernel(_bilateral_src, 'bilateral_kernel',   options=('-use
 _k_sobel     = cp.RawKernel(_sobel_src,     'fused_sobel_kernel',  options=('-use_fast_math',))
 _k_devernay  = cp.RawKernel(_devernay_src,  'fast_devernay_kernel', options=('-use_fast_math',))
 
-# Structuring element reused for CPU morphological close
 _CPU_CLOSE_K = np.ones((3, 3), dtype=np.uint8)
 
 
@@ -168,18 +148,13 @@ def compute_edges(
     min_edge_length: int = 25,
     downsample: float = 1.0
 ) -> "EdgeResult | tuple[EdgeResult, dict]":
-    """
-    Run the fully-fused, GPU-accelerated Canny-Devernay edge pipeline on a BGR frame.
-    """
+
     stages: dict = {} if capture_stages else None
 
     # ── Step 1: Grayscale (CPU) ─────────────────────────────────────────────
-    # OpenCV's CPU cvtColor is incredibly fast. Leaving this on the CPU
-    # avoids unnecessary complexity before the GPU handoff[cite: 1].
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     H, W = gray.shape[:2]
-    if capture_stages:
-        stages["gray"] = gray.copy()
+    if capture_stages: stages["gray"] = gray.copy()
 
     # ── Step 2: Prepare Downsample ──────────────────────────────────────────
     if downsample != 1.0:
@@ -193,7 +168,6 @@ def compute_edges(
     # ── Step 3: Upload → Normalise (GPU) ────────────────────────────────────
     cp_frame = cp.asarray(work, dtype=cp.float32)
     height, width = cp_frame.shape
-
     block = (16, 16)
     grid  = ((width + 15) // 16, (height + 15) // 16)
 
@@ -211,15 +185,11 @@ def compute_edges(
     )
 
     # ── Step 5: Fused Sobel (GPU) ───────────────────────────────────────────
-    Gx    = cp.empty_like(cp_frame)
-    Gy    = cp.empty_like(cp_frame)
-    G_mag = cp.empty_like(cp_frame)
+    Gx = cp.empty_like(cp_frame); Gy = cp.empty_like(cp_frame); G_mag = cp.empty_like(cp_frame)
     _k_sobel(grid, block, (filtered, Gx, Gy, G_mag, width, height))
 
     # ── Step 6: Sub-pixel NMS + curvature rejection (GPU) ───────────────────
-    out_x    = cp.empty_like(G_mag)
-    out_y    = cp.empty_like(G_mag)
-    out_mask = cp.zeros(G_mag.shape, dtype=cp.bool_)
+    out_x = cp.empty_like(G_mag); out_y = cp.empty_like(G_mag); out_mask = cp.zeros(G_mag.shape, dtype=cp.bool_)
     _k_devernay(
         grid, block,
         (Gx, Gy, G_mag, out_x, out_y, out_mask,
@@ -227,14 +197,10 @@ def compute_edges(
     )
 
     # ── Step 7: Minimal PCIe Download for CPU Hysteresis ────────────────────
-    # Valid sub-pixel coordinates are reconstructed and scaled entirely on the GPU[cite: 2].
     out_mask_np = cp.asnumpy(out_mask)
     G_mag_np    = cp.asnumpy(G_mag)
 
-    closed = cv2.morphologyEx(
-        out_mask_np.view(np.uint8), cv2.MORPH_CLOSE, _CPU_CLOSE_K
-    )
-
+    closed = cv2.morphologyEx(out_mask_np.view(np.uint8), cv2.MORPH_CLOSE, _CPU_CLOSE_K)
     _, labels, _, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
     num_features = int(labels.max())
 
@@ -254,33 +220,25 @@ def compute_edges(
     clean_gpu = cp.asarray(clean_np)
 
     # ── Step 9: Reconstruct Coordinates (GPU) ───────────────────────────────
-    xs = out_x[clean_gpu]
-    ys = out_y[clean_gpu]
-
+    xs = out_x[clean_gpu]; ys = out_y[clean_gpu]
     ex_s = cp.full((small_h, small_w), -1.0, dtype=cp.float32)
     ey_s = cp.full((small_h, small_w), -1.0, dtype=cp.float32)
 
     if xs.size > 0:
         xs_i = cp.round(xs).astype(cp.int32).clip(0, small_w - 1)
         ys_i = cp.round(ys).astype(cp.int32).clip(0, small_h - 1)
-        ex_s[ys_i, xs_i] = xs
-        ey_s[ys_i, xs_i] = ys
+        ex_s[ys_i, xs_i] = xs; ey_s[ys_i, xs_i] = ys
 
     if downsample != 1.0:
         inv = 1.0 / downsample
         valid = ex_s >= 0.0
-
         ex_cp = cp.full((H, W), -1.0, dtype=cp.float32)
         ey_cp = cp.full((H, W), -1.0, dtype=cp.float32)
-
-        ex_valid = ex_s[valid]
-        ey_valid = ey_s[valid]
-
+        ex_valid = ex_s[valid]; ey_valid = ey_s[valid]
         ys_s = cp.round(ey_valid).astype(cp.int32).clip(0, small_h - 1)
         xs_s = cp.round(ex_valid).astype(cp.int32).clip(0, small_w - 1)
         ys_f = cp.round(ey_valid * inv).astype(cp.int32).clip(0, H - 1)
         xs_f = cp.round(ex_valid * inv).astype(cp.int32).clip(0, W - 1)
-
         ex_cp[ys_f, xs_f] = ex_s[ys_s, xs_s] * inv
         ey_cp[ys_f, xs_f] = ey_s[ys_s, xs_s] * inv
     else:
@@ -295,19 +253,12 @@ def compute_edges(
         xs_render = cp.round(ex_cp[valid_final]).astype(cp.int32).clip(0, W - 1)
         edge_map_cp[ys_render, xs_render] = 255
 
-    if capture_stages:
-        stages["edges_dev"] = cp.asnumpy(edge_map_cp)
+    if capture_stages: stages["edges_dev"] = cp.asnumpy(edge_map_cp)
 
     # ── Step 11: Sub-pixel edge points (GPU) ────────────────────────────────
     xs_cp = ex_cp[valid_final]
     ys_cp = ey_cp[valid_final]
     edge_points_cp = cp.column_stack([xs_cp, ys_cp]).astype(cp.float32)
-
-    if capture_stages:
-        viz_cp = cp.zeros((H, W), dtype=cp.uint8)
-        if len(edge_points_cp) > 0:
-            viz_cp[ys_render, xs_render] = 255
-        stages["edge_points_viz"] = cp.asnumpy(viz_cp)
 
     # ── Step 12: Distance Transform (GPU) ───────────────────────────────────
     if len(edge_points_cp) > 0:
@@ -319,35 +270,21 @@ def compute_edges(
     if capture_stages:
         stages["distance_field"] = cp.asnumpy(dist_cp)
 
-    # ── Step 13: Centroid = distance-field weighted moment (inside edge bbox) ─
-    # Weight = dist^4 strongly concentrates mass on the part interior while
-    # suppressing spurious edge pixels.  Using the full moment (not argmax)
-    # avoids flying off to an isolated peak in a corner.
-    # Works with outer contour visible OR inner holes/features only.
+    # ── Step 13: Initial Guess Centroid (Trimmed Median Approach) ───────────
+    # STRICTEMENT SYNCHRONISÉ AVEC LE SOLVEUR FIT_SERVICE
     if len(edge_points_cp) > 0:
-        margin = 50
-        x_min = int(max(0,     cp.min(xs_cp).item() - margin))
-        x_max = int(min(W - 1, cp.max(xs_cp).item() + margin))
-        y_min = int(max(0,     cp.min(ys_cp).item() - margin))
-        y_max = int(min(H - 1, cp.max(ys_cp).item() + margin))
+        x_p10, x_p90 = cp.percentile(xs_cp, q=cp.array([10, 90]))
+        y_p10, y_p90 = cp.percentile(ys_cp, q=cp.array([10, 90]))
 
-        roi = dist_cp[y_min:y_max + 1, x_min:x_max + 1]   # (rH, rW)
+        valid_x = xs_cp[(xs_cp >= x_p10) & (xs_cp <= x_p90)]
+        valid_y = ys_cp[(ys_cp >= y_p10) & (ys_cp <= y_p90)]
 
-        # dist^4 → strongly favours the part body over edges/background
-        w = roi ** 4
-        w_sum = float(cp.sum(w)) + 1e-8
-
-        rH, rW = roi.shape
-        col_idx = cp.arange(rW, dtype=cp.float32)[None, :]  # (1, rW)
-        row_idx = cp.arange(rH, dtype=cp.float32)[:, None]  # (rH, 1)
-
-        cx = float(cp.sum(w * col_idx) / w_sum) + x_min
-        cy = float(cp.sum(w * row_idx) / w_sum) + y_min
+        cx = float(cp.median(valid_x)) if valid_x.size > 0 else W / 2.0
+        cy = float(cp.median(valid_y)) if valid_y.size > 0 else H / 2.0
     else:
         cx, cy = W / 2.0, H / 2.0
 
     # ── Step 14: Final PCIe Download ────────────────────────────────────────
-    # The arrays are downloaded only once, right at the end.
     result = EdgeResult(
         mask=None,
         edges=cp.asnumpy(edge_map_cp),

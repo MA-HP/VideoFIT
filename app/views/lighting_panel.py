@@ -9,7 +9,7 @@ import os
 from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtWidgets import QGridLayout, QLabel, QPushButton, QSlider, QWidget
 
-from app.services.lighting_service import CHANNEL_NAMES
+from app.services.lighting_service import _DEFAULT_CHANNEL_NAMES
 from app.views.glass_panel import GlassPanel
 
 _ON_OFF_STYLE = """
@@ -43,13 +43,14 @@ class LightingPanel(GlassPanel):
     intensity_changed = Signal(int, float)  # (channel, intensity 0–100)
     channel_toggled = Signal(int, bool)     # (channel, is_on)
 
-    def __init__(self, active_channels: set[int] | None = None, parent: QWidget | None = None) -> None:
+    def __init__(self, active_channels: set[int] | None = None, channel_names: dict[int, str] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent=parent)
 
         self._sliders: dict[int, QSlider] = {}
         self._value_labels: dict[int, QLabel] = {}
         self._toggle_btns: dict[int, QPushButton] = {}
         self._active_channels: set[int] = active_channels or {1, 2, 3, 4}
+        self._channel_names: dict[int, str] = channel_names or dict(_DEFAULT_CHANNEL_NAMES)
 
         self._layout = QGridLayout(self)
         self._layout.setContentsMargins(15, 15, 15, 15)
@@ -67,7 +68,7 @@ class LightingPanel(GlassPanel):
             if ch not in active_channels:
                 continue
 
-            name = CHANNEL_NAMES.get(ch, f"CH{ch}")
+            name = self._channel_names.get(ch, f"CH{ch}")
             lbl = QLabel(f"{name}:")
 
             # ON/OFF toggle button with power icon

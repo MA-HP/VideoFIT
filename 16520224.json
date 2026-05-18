@@ -1,0 +1,67 @@
+{
+  "device": {
+    "model_name": "DFK 33UX183",
+    "serial": "16520224",
+    "unique_name": "The Imaging Source Europe GmbH-ic4-gentl-u3v-16520224"
+  },
+  "driver_properties": {
+    "LinkCommandTimeout": 5000000.0
+  },
+  "properties": {
+    "AcquisitionBurstFrameCount": 1,
+    "AcquisitionBurstInterval": 100,
+    "AcquisitionFrameRate": 8.0,
+    "AutoFunctionsROIEnable": true,
+    "AutoFunctionsROIPreset": "AutoFunctionsROIPreset_Center50Pct",
+    "BalanceRatioSelector": {
+      "(Value)": "Red",
+      "Blue": {
+        "BalanceRatio": 1.5625
+      },
+      "Green": {
+        "BalanceRatio": 1.0
+      },
+      "Red": {
+        "BalanceRatio": 1.953125
+      }
+    },
+    "BalanceWhiteAuto": "Off",
+    "BalanceWhiteMode": "WhiteBalanceMode_GrayWorld",
+    "BlackLevel": 0.0,
+    "Contrast": 0,
+    "Denoise": 0,
+    "ExposureAuto": "Off",
+    "ExposureAutoHighlightReduction": false,
+    "ExposureAutoReference": 128,
+    "ExposureTime": 33333.0,
+    "GPOut": 0,
+    "Gain": 4.499402432580898,
+    "GainAuto": "Off",
+    "Gamma": 1.0,
+    "Height": 3648,
+    "Hue": 0.0,
+    "LUTEnable": false,
+    "PixelFormat": "BayerRG8",
+    "ReverseY": false,
+    "Saturation": 125.0,
+    "Sharpness": 0,
+    "SoftwareTransformEnable": true,
+    "StrobeDelay": 0,
+    "StrobeEnable": "Off",
+    "StrobeOperation": "Exposure",
+    "StrobePolarity": "ActiveLow",
+    "ToneMappingAuto": true,
+    "ToneMappingEnable": false,
+    "ToneMappingGlobalBrightness": 0.0,
+    "ToneMappingIntensity": 1.0,
+    "TriggerActivation": "RisingEdge",
+    "TriggerDebouncer": 0.0,
+    "TriggerDelay": 3.1,
+    "TriggerDenoise": 0.0,
+    "TriggerMask": 0.0,
+    "TriggerMode": "Off",
+    "TriggerOperation": "Default",
+    "TriggerSource": "Any",
+    "Width": 5472
+  }
+}

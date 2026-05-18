@@ -8,14 +8,20 @@ from __future__ import annotations
 
 import socket
 
-CHANNEL_NAMES = {1: "EPI", 2: "-", 3: "COAX", 4: "DIA"}
+_DEFAULT_CHANNEL_NAMES = {1: "EPI", 2: "-", 3: "COAX", 4: "DIA"}
 
 
 class LightingService:
 
-    def __init__(self, ip_address: str = "169.254.5.100", port: int = 62077) -> None:
+    def __init__(
+        self,
+        ip_address: str = "169.254.5.100",
+        port: int = 62077,
+        channel_names: dict[int, str] | None = None,
+    ) -> None:
         self.ip_address = ip_address
         self.port = port
+        self.channel_names: dict[int, str] = channel_names or dict(_DEFAULT_CHANNEL_NAMES)
 
     def set_intensity(self, channel: int, intensity: float) -> bool:
         intensity_str = f"{intensity:.2f}".rstrip("0").rstrip(".")

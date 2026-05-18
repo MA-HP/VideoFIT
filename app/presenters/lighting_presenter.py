@@ -79,10 +79,17 @@ class LightingPresenter(QObject):
 
         ip = settings.app_defaults.lighting_ip
         port = settings.app_defaults.lighting_port
-        self._service = LightingService(ip, port)
+        channel_names = {
+            1: settings.app_defaults.light_ch1_name,
+            2: settings.app_defaults.light_ch2_name,
+            3: settings.app_defaults.light_ch3_name,
+            4: settings.app_defaults.light_ch4_name,
+        }
+        self._service = LightingService(ip, port, channel_names=channel_names)
         self._worker = _LightingWorker(self._service)
 
         active = self._active_channels_from_defaults(settings.app_defaults)
+        self._panel._channel_names = channel_names
         self._rebuild_panel(active)
 
         if settings.cameras:

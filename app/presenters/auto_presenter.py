@@ -39,13 +39,12 @@ from app.models.settings import AppSettings
 from app.services.dxf_service import load_dxf
 from app.services.edge_service import compute_edges
 from app.services.fit_service import fit, fit_complete, fit_poc
-from app.services.lighting_service import LightingService, CHANNEL_NAMES
+from app.services.lighting_service import LightingService
 from app.views.dxf_overlay import DxfOverlay
 from app.views.image_viewer import ImageViewer
 from app.views.settings_panel import SettingsPanel
 from app.views.toolbar import Toolbar
 
-_NAME_TO_CHANNEL: dict[str, int] = {v: k for k, v in CHANNEL_NAMES.items()}
 _DETECT_WIDTH = 640
 
 
@@ -180,6 +179,9 @@ class AutoPresenter(QObject):
         self._settings_panel = settings_panel
         self._overlay = overlay
         self._lighting = lighting_service
+        self._name_to_channel: dict[str, int] = {
+            v.upper(): k for k, v in lighting_service.channel_names.items()
+        }
         self._app_dir = app_dir
         self._pool = QThreadPool.globalInstance()
 
@@ -456,7 +458,7 @@ class AutoPresenter(QObject):
 
     def _apply_lighting(self, params: dict) -> None:
         for name, intensity in params.items():
-            ch = _NAME_TO_CHANNEL.get(name.upper())
+            ch = self._name_to_channel.get(name.upper())
             if ch is not None:
                 self._lighting.set_intensity(ch, float(intensity))
                 print(f"[Auto] Light {name}={intensity} → ch{ch}")
