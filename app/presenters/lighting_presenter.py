@@ -8,6 +8,7 @@ no parallel connection conflicts.
 from __future__ import annotations
 
 import threading
+import warnings
 
 from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QPushButton
@@ -121,8 +122,10 @@ class LightingPresenter(QObject):
 
     def _rebuild_panel(self, active_channels: set[int]) -> None:
         try:
-            self._panel.intensity_changed.disconnect(self._on_intensity_changed)
-        except RuntimeError:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                self._panel.intensity_changed.disconnect(self._on_intensity_changed)
+        except (RuntimeError, TypeError):
             pass
         self._panel._active_channels = active_channels
         self._panel._sliders.clear()
