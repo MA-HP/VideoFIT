@@ -11,6 +11,7 @@ import sys
 
 from app.models.settings import AppSettings
 from app.services.camera_service import CameraService
+from app.services.edge_cache_service import EdgeCacheService
 from app.presenters.camera_presenter import CameraPresenter
 from app.presenters.compare_presenter import ComparePresenter
 from app.presenters.auto_presenter import AutoPresenter
@@ -122,6 +123,10 @@ class AppOrchestrator:
 
     def _wire_app_mode(self) -> None:
         """App mode: Measure/Compare toolbar with full presenter wiring."""
+        # Edge cache service — monitors frames for stability, computes edges
+        self._edge_cache = EdgeCacheService(parent=self._window)
+        self._camera_service.frame_ready.connect(self._edge_cache.on_frame)
+
         self._compare_presenter = ComparePresenter(
             settings=self._settings,
             viewer=self._window.viewer,
@@ -134,19 +139,29 @@ class AppOrchestrator:
             settings=self._settings,
             viewer=self._window.viewer,
             toolbar=self._window.toolbar,
+            edge_cache=self._edge_cache,
         )
 
         # Toolbar repositioning after mode switch
         self._window.toolbar.btn_measure.clicked.connect(self._reposition_toolbar)
         self._window.toolbar.btn_compare.clicked.connect(self._reposition_toolbar)
 
-        # Clear overlays on mode switch
+        # Clear overlays on mode switch and manage edge cache
         self._window.toolbar.btn_measure.clicked.connect(
             self._compare_presenter.clear_overlay
+        )
+        self._window.toolbar.btn_measure.clicked.connect(
+            self._measure_presenter.activate
+        )
+        self._window.toolbar.btn_compare.clicked.connect(
+            self._measure_presenter.deactivate
         )
         self._window.toolbar.btn_compare.clicked.connect(
             self._measure_presenter.clear_overlay
         )
+
+        # Start with measure mode active
+        self._measure_presenter.activate()
 
     # ------------------------------------------------------------------
     # Public

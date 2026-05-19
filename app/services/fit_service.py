@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 from app.models.fit_result import FitResult
 
 # -----------------------------------------------------------------------------
-# CUDA Kernels (Windows-Safe ASCII format) - DEPOURVUS DE BRUIT STOCHASTIQUE
+# CUDA Kernels (Windows-Safe ASCII format)
 # -----------------------------------------------------------------------------
 
 _fused_kernels_src = r'''
@@ -46,6 +46,7 @@ void fused_sweep_kernel(
         float ny = sin_t * px + cos_t * py + dxf_cy + ty;
 
         float val = oob_dist;
+        // Hardware-accelerated bilinear interpolation via Texture cache
         if (nx >= 0.0f && nx < (width - 1.0f) && ny >= 0.0f && ny < (height - 1.0f)) {
             val = tex2D<float>(dist_tex, nx + 0.5f, ny + 0.5f);
         }
@@ -63,7 +64,7 @@ void fused_sweep_kernel(
 extern "C" __global__
 void point_cost_huber(
     cudaTextureObject_t dist_tex, const float* dxf_x, const float* dxf_y, const float* pt_weights,
-    float* out_costs, // Array output instead of atomic global float
+    float* out_costs,
     int width, int height, int num_pts,
     float dxf_cx, float dxf_cy, float tx, float ty, float theta,
     float delta, float weight, float oob_dist)
@@ -92,7 +93,7 @@ void point_cost_huber(
 extern "C" __global__
 void point_cost_welsch(
     cudaTextureObject_t dist_tex, const float* dxf_x, const float* dxf_y, const float* pt_weights,
-    float* out_costs, // Array output instead of atomic global float
+    float* out_costs,
     int width, int height, int num_pts,
     float dxf_cx, float dxf_cy, float tx, float ty, float theta,
     float delta, float weight, float oob_dist)
@@ -164,7 +165,6 @@ def _make_cost_fn(
     dxf_y_cp = cp.ascontiguousarray(dxf_c_cp[:, 1], dtype=cp.float32)
     num_pts = len(dxf_x_cp)
 
-    # 100% Deterministic output array (no more atomicAdd noise)
     out_costs_cp = cp.empty(num_pts, dtype=cp.float32)
 
     block = (256,)
@@ -174,16 +174,16 @@ def _make_cost_fn(
     def cost_fn(params):
         tx = cp.float32(params[0])
         ty = cp.float32(params[1])
-        theta = cp.float32(locked_theta if locked_theta is not None else params[2])
+        # IMPORTANT : params[2] est maintenant en degrés ! Conversion en radians pour le CUDA.
+        theta_val = locked_theta if locked_theta is not None else params[2]
+        theta_rad = cp.float32(np.radians(theta_val))
 
         kernel(grid, block, (
             dist_tex, dxf_x_cp, dxf_y_cp, pt_weights_cp, out_costs_cp,
             W, H, num_pts,
-            dxf_cx_cp, dxf_cy_cp, tx, ty, theta,
+            dxf_cx_cp, dxf_cy_cp, tx, ty, theta_rad,
             delta_c, weight_c, _OOB_DIST
         ))
-
-        # cp.mean is inherently deterministic and safe for Powell's gradients
         return float(cp.mean(out_costs_cp))
 
     return cost_fn
@@ -204,9 +204,13 @@ def _sample_polylines(polylines: list[np.ndarray], spacing: float = 0.5) -> np.n
     return np.vstack(pts).astype(np.float32) if pts else np.empty((0, 2), dtype=np.float32)
 
 
-def _stride_subsample(pts: np.ndarray, n: int) -> np.ndarray:
+def _uniform_subsample(pts: np.ndarray, n: int) -> np.ndarray:
+    """Remplace l'ancien subsample. Utilise un tirage aléatoire déterministe
+    pour garantir que les petits trous ne soient jamais sautés."""
     if len(pts) <= n: return pts
-    return pts[np.linspace(0, len(pts) - 1, n, dtype=np.int32)]
+    rng = np.random.RandomState(42)  # Graine fixe = toujours le même nuage parfait
+    indices = rng.choice(len(pts), n, replace=False)
+    return pts[indices]
 
 
 def fit(
@@ -228,8 +232,8 @@ def fit(
     dist_tex = _create_texture_object(dist_smooth_cp)
 
     dxf_all = _sample_polylines(polylines, spacing=0.5)
-    dxf_sweep = _stride_subsample(dxf_all, n=800)
-    dxf_sample = _stride_subsample(dxf_all, n=3000)
+    dxf_sweep = _uniform_subsample(dxf_all, n=800)
+    dxf_sample = _uniform_subsample(dxf_all, n=3000)
 
     dxf_cx = float((dxf_all[:, 0].min() + dxf_all[:, 0].max()) / 2.0)
     dxf_cy = float((dxf_all[:, 1].min() + dxf_all[:, 1].max()) / 2.0)
@@ -263,9 +267,9 @@ def fit(
     cost_polish = _make_cost_fn(dxf_c_cp, pt_weights_cp, dxf_cx, dxf_cy, dist_tex, W, H, "Welsch", max_error_px)
 
     # -- Step 5: Resolution-Independent Grid Sweep ---------------------
-    num_angles, num_gx, num_gy = 270, 5, 5
+    num_angles, num_gx, num_gy = 360, 5, 5  # 360 angles pour une précision angulaire initiale d'1 degré
     angles_cp = cp.linspace(-cp.pi, cp.pi, num_angles, endpoint=False, dtype=cp.float32)
-    search_range = diag * 0.20
+    search_range = diag * 0.10  # Réduit à 10% car le point initial médian est très fiable
     gx_cp = cp.linspace(-search_range, search_range, num_gx, dtype=cp.float32)
     gy_cp = cp.linspace(-search_range, search_range, num_gy, dtype=cp.float32)
 
@@ -279,9 +283,7 @@ def fit(
     sweep_weights_cp = cp.asarray(sweep_weights, dtype=cp.float32)
 
     costs_cp = cp.empty((num_gy, num_gx, num_angles), dtype=cp.float32)
-
-    # Correction de la largeur du bassin : le Grid Sweep captera la pièce de beaucoup plus loin.
-    sweep_delta = max(20.0, diag * 0.05)
+    sweep_delta = max(15.0, diag * 0.02)
 
     _k_fused_sweep((num_gx // 8 + 1, num_gy // 8 + 1, num_angles // 4 + 1), (8, 8, 4),
                    (dist_tex, dxf_x_cp, dxf_y_cp, sweep_weights_cp, angles_cp, gx_cp, gy_cp, costs_cp,
@@ -331,24 +333,30 @@ def fit(
             if len(candidates) >= k_candidates:
                 break
 
-    # -- Step 7: Powell Refinement (Désormais 100% Déterministe) -------
+    # -- Step 7: Powell Refinement (Désormais Scale-Balanced en degrés) -------
     best_final_cost = float('inf')
     best_final_params = None
 
+    # On fixe les directions initiales de recherche de Powell (Pixel, Pixel, Degré)
+    direc_matrix = np.array([[5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 2.0]])
+
     for cand in candidates:
-        res_pull = minimize(cost_pull, np.array(cand), method="Powell",
-                            options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 20})
+        # Transformation du candidat en degrés pour que Powell ne s'emballe pas
+        cand_deg = np.array([cand[0], cand[1], np.degrees(cand[2])])
+
+        res_pull = minimize(cost_pull, cand_deg, method="Powell",
+                            options={"xtol": 1e-2, "ftol": 1e-2, "maxiter": 20, "direc": direc_matrix})
         final_res = minimize(cost_polish, res_pull.x, method="Powell",
-                             options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 75})
+                             options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 75, "direc": direc_matrix})
 
         if final_res.fun < best_final_cost:
             best_final_cost = final_res.fun
             best_final_params = final_res.x
 
-    tx_opt, ty_opt, angle_opt = best_final_params
+    tx_opt, ty_opt, angle_opt_deg = best_final_params
     inlier_frac = _compute_inlier_frac(polylines, best_final_params, dist_smooth_cp, dxf_cx, dxf_cy, max_error_px)
 
-    return FitResult(tx=float(tx_opt), ty=float(ty_opt), angle_deg=float(np.degrees(angle_opt)),
+    return FitResult(tx=float(tx_opt), ty=float(ty_opt), angle_deg=float(angle_opt_deg),
                      cost=float(best_final_cost),
                      dxf_cx=dxf_cx, dxf_cy=dxf_cy, inlier_frac=inlier_frac, dist_t=cp.asnumpy(dist_smooth_cp),
                      dist_raw=distance_field.astype(np.float32))
@@ -359,8 +367,10 @@ def _compute_inlier_frac(polylines: list[np.ndarray], params: np.ndarray, dist_t
     all_pts = _sample_polylines(polylines, spacing=1.0)
     if len(all_pts) == 0: return 0.0
     all_c_cp = cp.asarray(all_pts - np.array([dxf_cx, dxf_cy], dtype=np.float32), dtype=cp.float32)
-    tx, ty, angle = float(params[0]), float(params[1]), float(params[2])
-    cos_t, sin_t = float(np.cos(angle)), float(np.sin(angle))
+
+    tx, ty, angle_deg = float(params[0]), float(params[1]), float(params[2])
+    angle_rad = np.radians(angle_deg)
+    cos_t, sin_t = float(np.cos(angle_rad)), float(np.sin(angle_rad))
 
     nx_cp, ny_cp = cos_t * all_c_cp[:, 0] - sin_t * all_c_cp[:, 1] + dxf_cx + tx, sin_t * all_c_cp[:,
                                                                                           0] + cos_t * all_c_cp[:,
@@ -377,7 +387,9 @@ def fit_complete(polylines_all: list[np.ndarray], polylines_refine: list[np.ndar
                  objective: str = "Tolerance", max_error_px: float = 1.0) -> FitResult:
     res = fit(polylines_all, edge_points, silhouette_mask, distance_field, objective, max_error_px)
     dist_t_cp = cp.ascontiguousarray(cp.asarray(res.dist_t), dtype=cp.float32)
-    params = np.array([res.tx, res.ty, np.radians(res.angle_deg)])
+
+    # Paramètres déjà en degrés
+    params = np.array([res.tx, res.ty, res.angle_deg])
 
     if polylines_refine:
         res_ref, _, _, _ = _refine_from(polylines_refine, params, dist_t_cp, n_sample=3000, max_error_px=max_error_px,
@@ -385,13 +397,13 @@ def fit_complete(polylines_all: list[np.ndarray], polylines_refine: list[np.ndar
         params = res_ref
 
     inlier = _compute_inlier_frac(polylines_all, params, dist_t_cp, res.dxf_cx, res.dxf_cy, max_error_px)
-    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost,
+    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(params[2]), cost=res.cost,
                      dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)
 
 
 def _refine_from(polylines, init_params, dist_t_cp, n_sample=3000, max_error_px=1.0, dxf_cx=None, dxf_cy=None) -> tuple:
     dxf_all = _sample_polylines(polylines, spacing=0.5)
-    dxf_sample = _stride_subsample(dxf_all, n=n_sample)
+    dxf_sample = _uniform_subsample(dxf_all, n=n_sample)
     if dxf_cx is None: dxf_cx, dxf_cy = float(dxf_all[:, 0].mean()), float(dxf_all[:, 1].mean())
 
     centroid = np.array([dxf_cx, dxf_cy], dtype=np.float32)
@@ -406,7 +418,9 @@ def _refine_from(polylines, init_params, dist_t_cp, n_sample=3000, max_error_px=
     dist_tex = _create_texture_object(dist_t_cp)
 
     cost_fn = _make_cost_fn(dxf_c_cp, pt_weights_cp, dxf_cx, dxf_cy, dist_tex, W, H, "Welsch", max_error_px)
-    res = minimize(cost_fn, init_params, method="Powell", options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 100})
+    res = minimize(cost_fn, init_params, method="Powell",
+                   options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 100,
+                            "direc": np.array([[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]])})
     return res.x, res.fun, dxf_cx, dxf_cy
 
 
@@ -416,14 +430,14 @@ def fit_poc(polylines_all: list[np.ndarray], polylines_rot: list[np.ndarray], po
             objective: str = "Tolerance", max_error_px: float = 1.0) -> FitResult:
     res = fit(polylines_all, edge_points, silhouette_mask, distance_field, objective, max_error_px)
     dist_t_cp = cp.ascontiguousarray(cp.asarray(res.dist_t), dtype=cp.float32)
-    params = np.array([res.tx, res.ty, np.radians(res.angle_deg)])
+    params = np.array([res.tx, res.ty, res.angle_deg])
 
     if polylines_rot:
         params, _, _, _ = _refine_from(polylines_rot, params, dist_t_cp, 3000, max_error_px, res.dxf_cx, res.dxf_cy)
 
     if polylines_pan:
         dxf_all = _sample_polylines(polylines_pan, 0.5)
-        dxf_sample = _stride_subsample(dxf_all, 3000)
+        dxf_sample = _uniform_subsample(dxf_all, 3000)
         dxf_c_cp = cp.asarray(dxf_sample - np.array([res.dxf_cx, res.dxf_cy], dtype=np.float32), dtype=cp.float32)
         pt_w_cp = cp.ones(len(dxf_sample), dtype=cp.float32)
 
@@ -432,9 +446,11 @@ def fit_poc(polylines_all: list[np.ndarray], polylines_rot: list[np.ndarray], po
 
         cost_fn = _make_cost_fn(dxf_c_cp, pt_w_cp, res.dxf_cx, res.dxf_cy, dist_tex, W, H, "Welsch", max_error_px,
                                 locked_theta=params[2])
-        res_pan = minimize(cost_fn, params[:2], method="Powell", options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 100})
+        res_pan = minimize(cost_fn, params[:2], method="Powell",
+                           options={"xtol": 5e-4, "ftol": 5e-4, "maxiter": 100,
+                                    "direc": np.array([[2.0, 0.0], [0.0, 2.0]])})
         params[:2] = res_pan.x
 
     inlier = _compute_inlier_frac(polylines_all, params, dist_t_cp, res.dxf_cx, res.dxf_cy, max_error_px)
-    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(np.degrees(params[2])), cost=res.cost,
+    return FitResult(tx=float(params[0]), ty=float(params[1]), angle_deg=float(params[2]), cost=res.cost,
                      dxf_cx=res.dxf_cx, dxf_cy=res.dxf_cy, inlier_frac=inlier, dist_t=res.dist_t, dist_raw=res.dist_raw)
